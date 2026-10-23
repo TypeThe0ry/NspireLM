@@ -21,10 +21,12 @@
 
 #define NSLM_MAXV (NSLM_HIDDEN > NSLM_DIM ? NSLM_HIDDEN : NSLM_DIM)
 
+/* x4 layout (compiler/nslmc.py pack_x4): q is offset-binary uint8 in blocks of 4 rows x 8 columns
+ * (one 32-byte cache line); m is [rows/4][groups][4]; e is per row. */
 typedef struct {
-    const int8_t *q;   /* [rows][cols] */
-    const uint16_t *m; /* [rows][cols / gs] */
-    const int8_t *e;   /* [rows] */
+    const uint8_t *q;
+    const uint16_t *m;
+    const int8_t *e;
 } nslm_q8;
 
 typedef struct {
@@ -37,6 +39,7 @@ typedef struct {
     int32_t k[NSLM_KV_DIM], v[NSLM_KV_DIM];
     int32_t h1[NSLM_HIDDEN], h3[NSLM_HIDDEN];
     int16_t a[NSLM_MAXV];
+    int32_t asum[NSLM_MAXV / 8]; /* per-group sums of a, for the offset-binary correction */
     int16_t qh[NSLM_HEAD_DIM];
     int32_t z[NSLM_SEQ];
     int64_t w[NSLM_SEQ];
@@ -56,7 +59,7 @@ typedef struct {
     nslm_state *s;
 } nslm_model;
 
-/* Binds a loaded model.nslm image (must stay alive and be 4-byte aligned). 0 on success. */
+/* Binds a loaded model.nslm image (must stay alive and be 32-byte aligned). 0 on success. */
 int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state);
 
 /* One decoding step. Leaves Q16 logits in m->s->logits. */
@@ -67,8 +70,11 @@ int nslm_argmax(const int32_t *logits, int n);
 /* temp_q8: temperature in Q8 (256 = 1.0); 0 = greedy. rng: xorshift32 state. */
 int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng);
 
-/* Kernels (portable C in nslm_kern.c; ARM assembly versions replace them on device). */
-void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, int ea, int rows, int cols, int gs);
+/* Kernels (portable C in nslm_kern.c; ARM assembly versions replace them on device).
+ * out[r] = sat32(rshr(sum_g (d_rg * m_rg) >> 16, e_r + ea - 32)), d_rg = sum_{i in g} q_ri * a_i
+ * asum[g] = sum_{i in g} a_i. rows % 4 == 0, cols % 8 == 0, gs % 8 == 0. */
+void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
+                    int rows, int cols, int gs);
 
 /* Tokenizer (tok.nslt). */
 typedef struct {
