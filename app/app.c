@@ -279,8 +279,8 @@ static void selftest(void) {
     } else {
         report(r, sizeof r, "membench: alloc failed\n%.0ld%.0ld", 0, 0);
     }
+    plat_aligned_free(buf);
 #ifdef _TINSPIRE
-    free(buf); /* the device build uses malloc underneath */
     {
         size_t lo = 0, hi = 64u << 20;
         while (hi - lo > 65536) {

@@ -79,6 +79,8 @@ void *plat_aligned_alloc(size_t bytes) {
     return p;
 }
 
+void plat_aligned_free(void *p) { free(p); }
+
 void *plat_load(const char *name, size_t *len, void (*progress)(int pct)) {
     char path[512];
     snprintf(path, sizeof path, "%s/%s", dir, name);

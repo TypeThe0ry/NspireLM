@@ -112,12 +112,18 @@ void plat_present(const uint16_t *fb) { lcd_blit((void *)fb, SCR_320x240_565); }
 
 /* ------------------------------------------------------------------ memory and files */
 
+/* The OS malloc only guarantees 8-byte alignment; keep the raw pointer just below the aligned block. */
 void *plat_aligned_alloc(size_t bytes) {
-    unsigned char *p = malloc(bytes + 32);
-    if (!p) return 0;
-    unsigned char *a = (unsigned char *)(((uintptr_t)p + 31) & ~(uintptr_t)31);
+    unsigned char *raw = malloc(bytes + 32 + sizeof(void *));
+    if (!raw) return 0;
+    unsigned char *a = (unsigned char *)(((uintptr_t)raw + sizeof(void *) + 31) & ~(uintptr_t)31);
+    ((void **)a)[-1] = raw;
     memset(a, 0, bytes);
     return a;
+}
+
+void plat_aligned_free(void *p) {
+    if (p) free(((void **)p)[-1]);
 }
 
 void *plat_load(const char *name, size_t *len, void (*progress)(int pct)) {

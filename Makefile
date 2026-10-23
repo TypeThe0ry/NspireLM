@@ -43,4 +43,24 @@ $(MODEL)/nslm_app_arm: $(APPDEP) $(ASM) $(MODEL)/nslm_test.h
 	$(ARMCC) $(CFLAGS) $(WARN) -D_POSIX_C_SOURCE=200112L -DNSLM_HAVE_ASM_MATMUL -mcpu=arm926ej-s -marm -static \
 	  $(INC) $(APPSRC) $(ASM) -o $@
 
-.PHONY: host arm app-host
+# TI-Nspire CX II program (Ndless SDK). Output directory $(MODEL)/nspire holds everything to copy:
+# nslm.tns (program), model.nslm.tns, tok.nslt.tns.
+NDLESS ?= $(HOME)/ndless/ndless-sdk
+NSPIRE_ENV = PATH="$(NDLESS)/bin:$(NDLESS)/toolchain/install/bin:$$PATH"
+NSPIRE_FLAGS = -O2 -marm -std=gnu11 -Wall -Wextra -Wno-unused-function -DNSLM_HAVE_ASM_MATMUL $(INC) -Iapp
+NSPIRE_SRC = $(RT) $(APP) app/plat_nspire.c
+nspire: $(MODEL)/nspire/nslm.tns
+$(MODEL)/nspire/nslm.tns: $(NSPIRE_SRC) $(ASM) app/plat.h runtime/nslm.h $(MODEL)/nslm_model.h $(MODEL)/nslm_test.h
+	mkdir -p $(MODEL)/nspire
+	cd $(MODEL)/nspire && for f in $(abspath $(NSPIRE_SRC) $(ASM)); do \
+	  $(NSPIRE_ENV) nspire-gcc $(NSPIRE_FLAGS:-I%=-I$(CURDIR)/%) -c $$f -o $$(basename $$f).o || exit 1; done
+	cd $(MODEL)/nspire && $(NSPIRE_ENV) nspire-ld *.o -o nslm.elf
+	$(NSPIRE_ENV) genzehn --input $(MODEL)/nspire/nslm.elf --output $(MODEL)/nspire/nslm.zehn \
+	  --name "NspireLM" --author "NspireLM" --notice "offline language model" \
+	  --240x320-support true --uses-lcd-blit true
+	$(NSPIRE_ENV) make-prg $(MODEL)/nspire/nslm.zehn $@
+	rm -f $(MODEL)/nspire/nslm.zehn
+	cp $(MODEL)/model.nslm $(MODEL)/nspire/model.nslm.tns
+	cp $(MODEL)/tok.nslt $(MODEL)/nspire/tok.nslt.tns
+
+.PHONY: host arm app-host nspire
