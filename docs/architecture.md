@@ -26,6 +26,9 @@ tokenizer.bin  ─┼─► nslmc (AOT) ──┼─ nslm_model.h  shapes, offse
 | Mixed precision | `--bits-att/--bits-ffn/--bits-emb 4\|8`. int4 uses the x4n layout (4 rows × 16 columns per cache line). Rounding is GPTQ with `--calib` text, otherwise round-to-nearest with an MSE clipping search | memory, DRAM traffic |
 | Segments | The image is split at tensor boundaries into ≤ 1 MiB pieces (`nslm_seg_off[]`), and the embedding/classifier into row parts. Each piece is allocated separately: the Ndless heap gives ~21.5 MiB in one block but ~27 MiB in pieces | the single-block ceiling |
 
+| KV layout | Keys are stored per head as [pos][dim] and values transposed as [dim][pos], both offset-binary bytes. Attention scores and the weighted value sum are then both contiguous int16×uint8 dot products (`runtime/arm/dot_s16_u8.S`) | strided byte loads |
+| Decoding | `nslm_decode`: temperature, min-p (a log2-domain threshold) and a presence penalty, all integer. The presets were chosen by `tools/sample_eval.py` (see below) | — |
+
 ## Number formats (runtime)
 
 | Name | Representation | Used for |
@@ -72,3 +75,35 @@ the host build. The gate runs the app on the host and on ARMv5 under qemu, and b
 `BITEXACT`. On the calculator, the same report also includes the CPU clock, ms/token, the free heap, and a
 sequential-vs-stride memory benchmark. That benchmark measures the one open parameter of the cycle model
 (`docs/perf-model.md`).
+
+## Decoding policy (measured, `tools/sample_eval.py`)
+
+Each policy continues 24 validation-story openings by 140 tokens. The continuation is scored by its
+perplexity under stories42M (float) as the judge (real TinyStories text scores ≈2.12), by 4-gram
+repetition within a story, and by distinct bigrams across stories. Results for stories15M (int8,
+vocab 12750):
+
+| Policy | judge PPL | rep4 | distinct-2 |
+|---|---|---|---|
+| greedy | 1.80 | 5.9% (loops) | 0.478 |
+| greedy + presence 1.0 (**precise**) | 1.84 | 1.4% | 0.551 |
+| T 1.0 | 6.45 | 0.6% | 0.695 |
+| T 0.8 | 3.64 | 1.4% | 0.619 |
+| T 0.8, min-p 0.05 | 2.42 | 1.5% | 0.560 |
+| T 0.6, min-p 0.05, presence 0.5 (**balanced**, default) | 2.11 | 1.8% | 0.558 |
+| T 0.8, min-p 0.05, presence 1.0 (**creative**) | 2.54 | 1.6% | 0.617 |
+
+## Where the time goes, and what was rejected
+
+On a 396 MHz CX II (cycle model), stories15M int8 with vocab 12750 takes 128.5 ms/token at position 8 and
+145.6 ms at position 255. 81% of that is matmul, streaming weights at ~82 MB/s against a measured 97 MB/s
+DRAM ceiling. 10% is attention, near its KV-traffic floor.
+
+- **Speculative decoding is rejected.** The ARM926 D-cache blocks during a line fill, so an extra verified
+  token in the same weight pass still costs ~60% of a full token. With 30–50% draft acceptance, throughput
+  would drop.
+- **Batched prefill is deferred.** With 14 registers, the per-token accumulators must be spilled for each
+  cache line, which limits the gain to ~1.3× on the prompt (≈0.7 s for 20 prompt tokens). Model loading from
+  NAND (~5 s) dominates time to first token.
+- The remaining speed levers reduce bytes per token: int4 weights (stories15M all-int4: 9.0 tok/s at +11%
+  perplexity) or a smaller vocabulary.

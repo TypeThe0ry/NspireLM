@@ -76,3 +76,15 @@ void nslm_matmul_q4(int32_t *out, const nslm_q8 *w, const int16_t *a, const int3
     }
 }
 #endif
+
+#ifndef NSLM_HAVE_ASM_MATMUL
+int32_t nslm_dot_s16_u8(const int16_t *a, const uint8_t *u, int n) {
+    int32_t d = 0;
+    for (int i = 0; i < n; i++) d += (int32_t)a[i] * u[i];
+    return d;
+}
+
+void nslm_dots_s16_u8(int32_t *out, const int16_t *a, const uint8_t *u, int n, int rows) {
+    for (int r = 0; r < rows; r++) out[r] = nslm_dot_s16_u8(a, u + (size_t)r * n, n);
+}
+#endif

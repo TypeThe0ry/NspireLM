@@ -9,7 +9,7 @@ WARN = -std=c11 -Wall -Wextra -Werror -Wno-unused-function
 SRC = runtime/nslm.c runtime/nslm_kern.c runtime/nslm_tok.c host/main.c
 INC = -Iruntime -I$(MODEL)
 
-ASM = runtime/arm/matmul_q8.S runtime/arm/matmul_q4.S
+ASM = runtime/arm/matmul_q8.S runtime/arm/matmul_q4.S runtime/arm/dot_s16_u8.S
 
 host: $(MODEL)/nslm_host
 arm: $(MODEL)/nslm_arm $(MODEL)/nslm_armc

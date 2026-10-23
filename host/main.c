@@ -35,7 +35,7 @@ static void *slurp(const char *path, size_t *len) {
 }
 
 /* The cycle model (perf/arm926.c) prints counters each time this function's block executes. */
-__attribute__((noinline)) void nslm_perf_mark(int id) {
+__attribute__((noipa)) void nslm_perf_mark(int id) { /* noipa: no clone, so the plugin sees one address */
     __asm__ volatile("" ::: "memory");
     (void)id;
 }
@@ -79,6 +79,12 @@ int main(int argc, char **argv) {
             int far = atoi(argv[i + 1]);
             if (far >= NSLM_SEQ) far = NSLM_SEQ - 1;
             nslm_forward(&model, 1, 7);
+            if (getenv("NSLM_BENCH_FAR_FIRST")) { /* profile the far position (perf/profile.py) */
+                nslm_perf_mark(0);
+                nslm_forward(&model, 301 % NSLM_VOCAB, far);
+                nslm_perf_mark(1);
+                return 0;
+            }
             nslm_perf_mark(0);
             nslm_forward(&model, 300 % NSLM_VOCAB, 8);
             nslm_perf_mark(1);
