@@ -15,7 +15,7 @@
 
 ## 需要的东西
 
-- 已装 Ndless 的 CX II（r2020 对应 OS 6.2.0.333，r2022 对应 OS 6.4.0.74）；
+- 能运行 Ndless 的 CX II / CX II CAS（OS 6.2.0.333 或 6.4.0.74，用 Ndless r2022；OS 6.3.x 不支持，需要先升级到 6.4.0.74）；
 - TI-Nspire Link / Student Software，或者 [n-link](https://github.com/lights0123/n-link)；
 - 本仓库 Release 或 CI 构建产物中的 `nspire/` 目录，里面有三个文件：
 
@@ -25,11 +25,19 @@
 | `model.nslm.tns` | 模型权重（stories15M，词表裁剪到 12750，约 9.7 MB） |
 | `tok.nslt.tns` | 分词器 |
 
+## 先装好 Ndless
+
+普通安装方式下 Ndless **不常驻**：关机重启或复位以后都要重新激活一次。
+
+1. 从 <https://github.com/ndless-nspire/Ndless/releases> 下载 r2022，取出 `ndless_installer_4.5.5-6.2.0-6.4.0.tns` 和 `ndless_resources.tns`。
+2. 在计算器根目录建一个名叫 `ndless` 的文件夹，把这两个文件放进去。
+3. 在计算器上打开安装程序，按任意字母键等待完成。失败或自动重启就再试一次。
+
 ## 步骤
 
 1. **把三个文件放进计算器的同一个文件夹**，例如 `My Documents/nslm/`。
 2. **拔掉 USB 线。** 插着 USB 时 CPU 只跑 288 MHz，不插是 396 MHz。速度测试要在电池供电下进行。
-3. **建议先复位一次。** 同时按 `doc` + `enter` + `EE`，或者用背面的复位孔。这样可以保证内存没有被之前崩溃的程序占住：ChatTLM 实测过，崩溃后堆只剩约 5 MiB，必须复位才能恢复。
+3. **建议先复位一次，然后重新打开 Ndless 安装程序。** 复位方法：同时按 `doc` + `enter` + `EE`，或者用背面的复位孔。复位能保证内存没有被之前崩溃的程序占住：ChatTLM 实测过，崩溃后堆只剩约 5 MiB，必须复位才能恢复。但复位也会让 Ndless 失效，所以复位后一定要再运行一次 `ndless/ndless_installer...`。
 4. **在文件浏览器里打开 `nslm.tns`。** 加载约 9.7 MB 需要 5–8 秒，底部有进度条。
 5. **按 `menu` 运行自检。** 屏幕上会列出结果，同时写入同一文件夹下的 `nslm_selftest.txt.tns`。
 6. **试着生成：** 输入一个故事开头，比如 `Lily found a`，按 `enter`。
@@ -62,6 +70,7 @@ free_largest_kb=... state_kb=...
 
 | 现象 | 可能原因 / 做法 |
 |---|---|
+| 打开 `nslm.tns` 时提示文档格式不受支持（"This document format is not supported"） | Ndless 没有激活：重新打开 `ndless/ndless_installer...`；如果已经激活过还提示这个，可能是内存不够，复位后重新激活 Ndless 再试 |
 | 提示 "not found next to this program" | 三个文件不在同一文件夹，或者扩展名不是 `.tns` |
 | 提示 "Not enough memory" | 先复位计算器再试 |
 | 屏幕卡住不动 | 拍照记录卡在哪一步（加载进度多少），然后复位 |
