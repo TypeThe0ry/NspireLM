@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
 from common import TEACHER, attach_qat, chat_text, init_student, load_vocab  # noqa: E402
-from data import load_chats, packed_batches, tokenize_chat  # noqa: E402
+from data import _bl, load_chats, packed_batches, tokenize_chat  # noqa: E402
 
 AMP = [torch.bfloat16]  # set in main()
 
@@ -71,7 +71,7 @@ def answers(student, tok, vocab, dev, n_new=48):
     end = int(vocab.old2new[2])
     for q in QUESTIONS:
         ids, _ = tokenize_chat(tok, vocab, [{"role": "user", "content": q}], chat_text)
-        ids += vocab.resegment(tok("<|im_start|>assistant\n", add_special_tokens=False).input_ids)
+        ids += [1] + vocab.resegment(_bl(tok).encode_full("assistant\n"))
         x = list(vocab.old2new[ids])
         gen = []
         for _ in range(n_new):

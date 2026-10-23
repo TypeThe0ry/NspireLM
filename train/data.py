@@ -36,14 +36,33 @@ def load_chats(split, n=None, seed=0, max_chars=1200):
     return out
 
 
+_BL = {}
+
+
+def _bl(tok):
+    """compiler/bltok.py on the teacher's tokenizer.json: the exact encoder the calculator runs (HF builds
+    differ in one whitespace corner case, see bltok.pretokenize)."""
+    key = tok.name_or_path
+    if key not in _BL:
+        import os
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "compiler"))
+        import bltok
+        from huggingface_hub import hf_hub_download
+        _BL[key] = bltok.ByteLevelBPE(hf_hub_download(key, "tokenizer.json"))
+    return _BL[key]
+
+
 def tokenize_chat(tok, vocab, msgs, chat_text):
-    """Teacher BPE, then the merge split onto the kept vocabulary. Returns (ids, loss_mask) where the mask
-    marks assistant tokens (including their <|im_end|>)."""
+    """Teacher BPE (bltok, as on the device), then the merge split onto the kept vocabulary. Returns
+    (ids, loss_mask) where the mask marks assistant tokens (including their <|im_end|>)."""
+    bl = _bl(tok)
+    enc = lambda text: vocab.resegment(bl.encode_full(text))  # noqa: E731
     ids, mask = [], []
     for m in msgs:
-        head = vocab.resegment(tok(f"<|im_start|>{m['role']}\n", add_special_tokens=False).input_ids)
-        body = vocab.resegment(tok(m["content"] + "<|im_end|>", add_special_tokens=False).input_ids)
-        nl = vocab.resegment(tok("\n", add_special_tokens=False).input_ids)
+        head = [1] + enc(f"{m['role']}\n")
+        body = enc(m["content"]) + [2]
+        nl = enc("\n")
         a = m["role"] == "assistant"
         ids += head + body + nl
         mask += [0] * len(head) + [int(a)] * len(body) + [0] * len(nl)

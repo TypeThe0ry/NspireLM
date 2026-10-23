@@ -47,8 +47,13 @@ def _cls(c):
 CONTRACTIONS = (b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d")
 
 
-def pretokenize(text):
-    """bytes -> list of byte strings"""
+def pretokenize(text, lookahead_across_digits=False):
+    """bytes -> list of byte strings.
+
+    HF tokenizers builds disagree on one corner: whether `\\s+(?!\\S)` at the end of a Digits segment
+    sees the digit that follows ("x  1": "  " or " ", " "). We fix the segment-local reading (the regex
+    applied to each segment on its own); training tokenizes with this module too (train/data.py), so the
+    device matches training whatever HF build is installed."""
     out = []
     segs, st = [], 0
     for i, c in enumerate(text):  # Digits(individual_digits=True): every digit is its own segment
@@ -77,8 +82,9 @@ def pretokenize(text):
                 j = i
                 while j < n and _cls(s[j]) == "s":
                     j += 1
-                # \s+(?!\S): the lookahead sees past the digit split (HF slices keep the full string)
-                if j < len(s) and _cls(s[j]) != "s" and j - i >= 2:
+                # \s+(?!\S): leave the last space to start the next token
+                lim = len(s) if lookahead_across_digits else n
+                if j < lim and _cls(s[j]) != "s" and j - i >= 2:
                     j -= 1
             out.append(s[i:j])
             i = j
@@ -104,6 +110,7 @@ class ByteLevelBPE:
             ia, ib, io = self.t2i[a], self.t2i[b], self.t2i[a + b]
             self.merges.setdefault((ia, ib), (r, io))
             self.split.setdefault(io, (ia, ib))
+        self._bpe_memo = {}
         self.set_keep(keep)
 
     def set_keep(self, keep):
@@ -127,6 +134,12 @@ class ByteLevelBPE:
         return r
 
     def bpe(self, word):
+        r = self._bpe_memo.get(word)
+        if r is None:
+            r = self._bpe_memo[word] = self._bpe(word)
+        return r
+
+    def _bpe(self, word):
         toks = [self.byte_tok[c] for c in word]
         while len(toks) > 1:
             best, bi = None, -1
@@ -139,11 +152,11 @@ class ByteLevelBPE:
             toks[bi:bi + 2] = [best[1]]
         return toks
 
-    def encode_full(self, text):
+    def encode_full(self, text, lookahead_across_digits=False):
         """teacher-space ids of plain text (no special tokens)"""
         if isinstance(text, str):
             text = text.encode("utf-8")
-        return [t for w in pretokenize(text) for t in self.bpe(w)]
+        return [t for w in pretokenize(text, lookahead_across_digits) for t in self.bpe(w)]
 
     def encode(self, text):
         """model ids"""

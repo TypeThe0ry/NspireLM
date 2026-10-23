@@ -155,7 +155,7 @@ static int encode_bl(const nslm_tok *t, const char *text, int *out) {
                 } else {
                     j = i;
                     while (j < end && bl_cls(s[j]) == 's') j++;
-                    if (j < total && bl_cls(s[j]) != 's' && j - i >= 2) j--; /* \s+(?!\S) sees past the segment */
+                    if (j < end && bl_cls(s[j]) != 's' && j - i >= 2) j--; /* \s+(?!\S), segment-local */
                 }
             }
             n += bl_word(t, s + i, j - i, out + n);
