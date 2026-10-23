@@ -273,9 +273,12 @@ static void selftest(void) {
     memset(state, 0, sizeof *state);
     report(r, sizeof r, "tok_us_pos8=%ld tok_us_last=%ld\n", (long)(t1 - t0), (long)(t2 - t1));
 
-    /* memory system: sequential (LDM, whole line) vs one word per line -> linefill shape */
-    const uint32_t bytes = 4u << 20;
-    uint32_t *buf = plat_aligned_alloc(bytes);
+    /* memory system: sequential (LDM, whole line) vs one word per line -> linefill shape.
+     * 4 MB if the heap has it; after the model is loaded the device may only have ~3 MB left, and
+     * anything well past the 16 KB D-cache measures the same thing. */
+    uint32_t bytes = 4u << 20;
+    uint32_t *buf = NULL;
+    for (; bytes >= (256u << 10) && !(buf = plat_aligned_alloc(bytes)); bytes >>= 1) {}
     if (buf) {
         for (uint32_t i = 0; i < bytes / 4; i++) buf[i] = i;
         volatile uint32_t sink = 0;
@@ -288,7 +291,8 @@ static void selftest(void) {
         long lines = (long)(bytes / 32);
         long seq_cpl = mhz ? (long)((t1 - t0) * (uint64_t)mhz / (uint64_t)lines) : 0;
         long str_cpl = mhz ? (long)((t2 - t1) * (uint64_t)mhz / (uint64_t)lines) : 0;
-        report(r, sizeof r, "seq_us=%ld stride_us=%ld (4 MB)\n", (long)(t1 - t0), (long)(t2 - t1));
+        report(r, sizeof r, "seq_us=%ld stride_us=%ld", (long)(t1 - t0), (long)(t2 - t1));
+        report(r, sizeof r, " (%ld KB)\n%.0ld", (long)(bytes >> 10), 0);
         report(r, sizeof r, "cycles_per_line seq=%ld stride=%ld\n", seq_cpl, str_cpl);
     } else {
         report(r, sizeof r, "membench: alloc failed\n%.0ld%.0ld", 0, 0);
