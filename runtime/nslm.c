@@ -258,6 +258,9 @@ static void attention(nslm_state *s, int l, int pos) {
 void nslm_forward(nslm_model *m, int token, int pos) {
     nslm_state *s = m->s;
     static int64_t tmp[NSLM_MAXV];
+    if (token < 0 || token >= NSLM_VOCAB) token = 0; /* never index outside the compiled vocabulary */
+    if (pos < 0) pos = 0;
+    if (pos >= NSLM_SEQ) pos = NSLM_SEQ - 1;
     embed(s->x, &m->emb, token);
     const int32_t *rope_tab = m->rope + (size_t)pos * NSLM_HEAD_DIM;
     for (int l = 0; l < NSLM_LAYERS; l++) {
@@ -286,7 +289,7 @@ void nslm_forward(nslm_model *m, int token, int pos) {
         for (int i = 0; i < NSLM_DIM; i++) s->x[i] = sat32((int64_t)s->x[i] + s->xb[i]);
     }
     int ea = rmsnorm_act(s->a, s->x, m->rms_final, NSLM_DIM, tmp);
-    matmul(s, s->logits, &m->cls, ea, NSLM_VOCAB, NSLM_DIM, NSLM_GS_D);
+    matmul(s, s->logits, &m->cls, ea, NSLM_VOCAB_ROWS, NSLM_DIM, NSLM_GS_D);
 }
 
 /* ------------------------------------------------------------------ sampling */

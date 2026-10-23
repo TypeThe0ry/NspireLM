@@ -70,3 +70,7 @@ jobs:
           python3 compiler/nslmc.py ~/models/stories15M.bin ~/models/tokenizer.bin --out build/stories15M
           make MODEL=build/stories15M arm
           perf/check_speed.sh build/stories15M 4.8
+          python3 compiler/nslmc.py ~/models/stories15M.bin ~/models/tokenizer.bin --out build/stories15M-v12k \
+            --vocab-usage data/tinystories_usage.npy
+          make MODEL=build/stories15M-v12k arm
+          perf/check_speed.sh build/stories15M-v12k 7.4

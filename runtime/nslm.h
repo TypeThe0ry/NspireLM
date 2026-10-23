@@ -44,7 +44,7 @@ typedef struct {
     int32_t z[NSLM_SEQ];
     int64_t w[NSLM_SEQ];
     int16_t w16[NSLM_SEQ];
-    int32_t logits[NSLM_VOCAB];
+    int32_t logits[NSLM_VOCAB_ROWS]; /* only the first NSLM_VOCAB are real tokens */
     int8_t kc[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_DIM];
     int8_t vc[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_DIM];
     int32_t ks[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_HEADS];
@@ -78,14 +78,16 @@ void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, const int3
 
 /* Tokenizer (tok.nslt). */
 typedef struct {
-    int n, max_len;
+    int n, max_len, n_model;           /* full BPE vocab, longest piece, model vocab */
     const int32_t *rank;
     const uint32_t *off, *sorted;
+    const int32_t *old2new, *new2old; /* BPE id <-> model id (-1: compiled out) */
     const char *str;
 } nslm_tok;
 
 int nslm_tok_bind(nslm_tok *t, const void *image, size_t len);
-/* Returns the number of tokens written (BOS first). buf must hold strlen(text) + 3 entries. */
+/* Returns the number of model-vocabulary tokens written (BOS first); out must hold strlen(text) + 3
+ * entries and scratch 2 * max_len + 8 bytes. Pieces the model was compiled without are re-segmented. */
 int nslm_tok_encode(const nslm_tok *t, const char *text, int *out, char *scratch);
 /* Decoded bytes of `tok` following `prev`; *n receives the length. */
 const char *nslm_tok_piece(const nslm_tok *t, int prev, int tok, int *n, char byte_buf[2]);

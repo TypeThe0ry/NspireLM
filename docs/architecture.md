@@ -21,6 +21,7 @@ tokenizer.bin  ─┼─► nslmc (AOT) ──┼─ nslm_model.h  shapes, offse
 | Nonlinearities | `exp2` table (257 entries, Q30) and sigmoid table (1025 entries over ±16, Q30), with linear interpolation | `expf` |
 | Memory | Every tensor offset and every run-state buffer size is a compile-time constant. State is one allocation | allocator use, fragmentation |
 | Tokenizer | Float merge scores are replaced by integer ranks, and a pre-sorted index enables binary search | float compares, `qsort` at startup |
+| Vocabulary | `--vocab-usage`: tokens that never occur in the training corpus are compiled out of the embedding and classifier. stories15M goes from 32000 to 12750 tokens. The encoder still uses the full BPE and re-segments any compiled-out piece into kept pieces | 60% of classifier MACs, 5.5 MB |
 
 ## Number formats (runtime)
 
@@ -49,7 +50,8 @@ Current results (2026-10-23):
 | Model | positions | top-1 agree | KL (nats) | PPL float → int |
 |---|---|---|---|---|
 | stories260K | 1922 | 97.6% | 0.0019 | 3.218 → 3.216 |
-| stories15M | 702 | 98.2% | 0.0006 | 2.364 → 2.361 |
+| stories15M | 702 | 98.4% | 0.0006 | 2.364 → 2.362 |
+| stories15M, vocab 12750 | 702 | 98.4% | 0.0006 | 2.364 → 2.362 |
 
 Greedy generations of both models match llama2.c `run.c` (float32) token for token over the first 64 tokens of
 "Once upon a time".
