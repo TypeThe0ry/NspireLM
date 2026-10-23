@@ -40,7 +40,21 @@ static int prompt_end;
 static nslm_model model;
 static nslm_state *state;
 static nslm_tok tok;
-static int temp_q8 = 205; /* 0.8: greedy decoding loops on small models */
+/* Decoding presets chosen by tools/sample_eval.py (judge: stories42M float perplexity of the continuation,
+ * plus 4-gram repetition; real TinyStories text scores ~2.12):
+ *   precise   greedy + presence penalty 1.0        judge 1.84, rep4 1.4%  (deterministic)
+ *   balanced  T 0.6, min-p 0.05, penalty 0.5       judge 2.11, rep4 1.8%
+ *   creative  T 0.8, min-p 0.05, penalty 1.0       judge 2.54, rep4 1.6%, most diverse
+ * Plain T 0.8 sampling scores 3.64 and plain greedy loops (rep4 5.9%). */
+static const struct {
+    const char *name;
+    nslm_policy p;
+} presets[] = {
+    {"balanced", {154, -283242, 32768, 64}},
+    {"precise", {0, 0, 65536, 64}},
+    {"creative", {205, -283242, 65536, 64}},
+};
+static int preset = 0;
 static uint32_t rng = 0x9E3779B9u;
 
 /* ------------------------------------------------------------------ drawing */
@@ -130,15 +144,14 @@ static void set_status(const char *s) { /* truncates to the screen width on purp
 
 static void idle_status(void) {
     char s[96];
-    snprintf(s, sizeof s, "enter:go tab:T=%d.%02d menu:test esc:quit", temp_q8 / 256,
-             (temp_q8 % 256) * 100 / 256);
+    snprintf(s, sizeof s, "enter:go tab:%s menu:test esc", presets[preset].name);
     set_status(s);
 }
 
 /* ------------------------------------------------------------------ generation */
 
 static void generate(const char *prompt) {
-    static int ptoks[NSLM_SEQ + 8];
+    static int ptoks[NSLM_SEQ + 8], hist[NSLM_SEQ + 8];
     static char scratch[512];
     char buf[200];
     size_t plen = strlen(prompt);
@@ -156,12 +169,13 @@ static void generate(const char *prompt) {
     for (; pos < NSLM_SEQ; pos++) {
         if (plat_abort()) break;
         nslm_forward(&model, cur, pos);
+        hist[pos] = cur;
         int next;
         if (pos + 1 < np) {
             next = ptoks[pos + 1];
         } else {
             if (!tgen) tgen = plat_us();
-            next = nslm_sample(state->logits, NSLM_VOCAB, temp_q8, &rng);
+            next = nslm_decode(state->logits, NSLM_VOCAB, &presets[preset].p, hist, pos + 1, &rng);
             if (next == 1 || next == 2) break; /* BOS/EOS: the story is over */
             int len;
             char bb[2];
@@ -279,8 +293,8 @@ static void selftest(void) {
     } else {
         report(r, sizeof r, "membench: alloc failed\n%.0ld%.0ld", 0, 0);
     }
+    plat_aligned_free(buf);
 #ifdef _TINSPIRE
-    free(buf); /* the device build uses malloc underneath */
     {
         size_t lo = 0, hi = 64u << 20;
         while (hi - lo > 65536) {
@@ -397,7 +411,7 @@ int nslm_app_main(int argc, char **argv, int hash_only) {
         } else if (k == K_DEL) {
             if (input_len) input[--input_len] = 0;
         } else if (k == K_TAB) {
-            temp_q8 = temp_q8 == 0 ? 205 : temp_q8 == 205 ? 256 : 0; /* 0, 0.8, 1.0 */
+            preset = (preset + 1) % (int)(sizeof presets / sizeof presets[0]);
             idle_status();
         } else if (k == K_MENU) {
             selftest();

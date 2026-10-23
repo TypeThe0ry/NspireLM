@@ -33,6 +33,13 @@ run_model() {
     grep -q "BITEXACT" "$b/nslm_selftest.txt" || { cat "$b/nslm_selftest.txt"; exit 1; }
   done
   echo "$name$variant: app self-test BITEXACT on host and armv5"
+  # undefined behaviour would let a different compiler (the Ndless gcc) produce different integers
+  ${CC:-cc} -O1 -g -fsanitize=undefined,address -fno-sanitize-recover=all -std=c11 -D_POSIX_C_SOURCE=200112L \
+    -Iruntime -I"$b" -Iapp runtime/nslm.c runtime/nslm_kern.c runtime/nslm_tok.c app/app.c app/font8x8.c \
+    app/plat_host.c -o "$b/nslm_app_san"
+  NSLM_DIR="$b" NSLM_OUT="$b" NSLM_KEYS="Once upon a time{ENTER}{TAB}Hello wörld 你好{ENTER}{MENU}" "$b/nslm_app_san" >/dev/null
+  grep -q "BITEXACT" "$b/nslm_selftest.txt"
+  echo "$name$variant: UBSan + ASan clean"
 }
 
 run_model stories260K tok512 8

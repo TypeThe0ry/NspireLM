@@ -74,3 +74,46 @@ jobs:
             --vocab-usage data/tinystories_usage.npy
           make MODEL=build/stories15M-v12k arm
           perf/check_speed.sh build/stories15M-v12k 7.4
+  nspire:
+    runs-on: ubuntu-24.04
+    needs: gate
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabi libc6-dev-armel-cross \
+            libgmp-dev libmpfr-dev libmpc-dev texinfo zlib1g-dev libboost-program-options-dev \
+            python3-dev libexpat1-dev
+          pip install numpy
+      - name: Cache Ndless toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/ndless/ndless-sdk/toolchain/install
+          key: ndless-toolchain-9484d8d-v1
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ~/models
+          key: models-v1
+      - name: Ndless SDK
+        run: tools/setup_ndless.sh
+      - name: Build calculator package (stories15M, vocab 12750, int8)
+        run: |
+          mkdir -p ~/models && cd ~/models
+          [ -f stories15M.bin ] || curl -sSfL -o stories15M.bin https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+          [ -f tokenizer.bin ] || curl -sSfL -o tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
+          cd $GITHUB_WORKSPACE
+          python3 compiler/nslmc.py ~/models/stories15M.bin ~/models/tokenizer.bin --out build/stories15M-v12k \
+            --vocab-usage data/tinystories_usage.npy
+          make MODEL=build/stories15M-v12k NDLESS=$HOME/ndless/ndless-sdk nspire
+          cp docs/device-test.md build/stories15M-v12k/nspire/README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nspirelm-stories15M
+          path: |
+            build/stories15M-v12k/nspire/nslm.tns
+            build/stories15M-v12k/nspire/model.nslm.tns
+            build/stories15M-v12k/nspire/tok.nslt.tns
+            build/stories15M-v12k/nspire/README.md

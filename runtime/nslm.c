@@ -146,21 +146,21 @@ static void rope(int32_t *v, int nh, const int32_t *tab) {
     }
 }
 
-/* fx32 head vector -> int8 + Q24 scale (scale = maxabs / 127). */
-static int32_t quant_kv(int8_t *dst, const int32_t *src) {
+/* fx32 head vector -> offset-binary int8 (q + 128) with element stride `stride`, Q24 scale maxabs/127. */
+static int32_t quant_kv(uint8_t *dst, int stride, const int32_t *src) {
     uint32_t mx = 0;
     for (int i = 0; i < NSLM_HEAD_DIM; i++) {
         uint32_t a = uabs32(src[i]);
         if (a > mx) mx = a;
     }
     if (!mx) {
-        memset(dst, 0, NSLM_HEAD_DIM);
+        for (int i = 0; i < NSLM_HEAD_DIM; i++) dst[i * stride] = 128;
         return 0;
     }
     int64_t r = ((int64_t)127 << 32) / mx;
     for (int i = 0; i < NSLM_HEAD_DIM; i++) {
         int64_t q = rshr((int64_t)src[i] * r, 32);
-        dst[i] = (int8_t)(q > 127 ? 127 : q < -127 ? -127 : q);
+        dst[i * stride] = (uint8_t)((q > 127 ? 127 : q < -127 ? -127 : q) + 128);
     }
     return sat32(((int64_t)mx * 256 + 63) / 127);
 }
@@ -253,15 +253,19 @@ static void matmul(nslm_state *s, int32_t *out, const nslm_q8 *w, int ea, int ro
 
 static void attention(nslm_state *s, int l, int pos) {
     const int kvmul = NSLM_HEADS / NSLM_KV_HEADS;
+    const int n8 = (pos + 1 + 7) & ~7;
     for (int h = 0; h < NSLM_HEADS; h++) {
         int kh = h / kvmul;
         int eq = quant_act(s->qh, s->q + h * NSLM_HEAD_DIM, NSLM_HEAD_DIM);
+        int32_t qsum = 0;
+        for (int i = 0; i < NSLM_HEAD_DIM; i++) qsum += s->qh[i];
+        const uint8_t *kbase = s->kc[l][kh][0];
+        const int32_t *ks = s->ks[l][kh], *vs = s->vs[l][kh];
         int32_t zmax = INT32_MIN;
+        nslm_dots_s16_u8(s->z, s->qh, kbase, NSLM_HEAD_DIM, pos + 1);
         for (int t = 0; t <= pos; t++) {
-            const int8_t *kq = s->kc[l][t] + kh * NSLM_HEAD_DIM;
-            int32_t raw = 0;
-            for (int i = 0; i < NSLM_HEAD_DIM; i++) raw += (int32_t)s->qh[i] * kq[i];
-            int32_t z = sat32(rshr((int64_t)raw * s->ks[l][t][kh], eq + 8));
+            int32_t raw = s->z[t] - qsum * 128;
+            int32_t z = sat32(rshr((int64_t)raw * ks[t], eq + 8));
             s->z[t] = z;
             if (z > zmax) zmax = z;
         }
@@ -270,7 +274,7 @@ static void attention(nslm_state *s, int l, int pos) {
         for (int t = 0; t <= pos; t++) {
             int32_t p = exp2_q30(sat32((int64_t)s->z[t] - zmax));
             sum += p;
-            int64_t w = (int64_t)p * s->vs[l][t][kh];
+            int64_t w = (int64_t)p * vs[t];
             s->w[t] = w;
             if ((uint64_t)w > wmax) wmax = (uint64_t)w;
         }
@@ -280,17 +284,15 @@ static void attention(nslm_state *s, int l, int pos) {
             continue;
         }
         int sh = bitlen64(wmax) - 13;
-        for (int t = 0; t <= pos; t++) s->w16[t] = (int16_t)rshr(s->w[t], sh);
-        int32_t acc[NSLM_HEAD_DIM];
-        memset(acc, 0, sizeof acc);
-        for (int t = 0; t <= pos; t++) {
-            const int8_t *vq = s->vc[l][t] + kh * NSLM_HEAD_DIM;
-            int32_t w = s->w16[t];
-            if (!w) continue;
-            for (int i = 0; i < NSLM_HEAD_DIM; i++) acc[i] += w * vq[i];
-        }
+        int32_t wsum = 0;
+        for (int t = 0; t <= pos; t++) wsum += s->w16[t] = (int16_t)rshr(s->w[t], sh);
+        for (int t = pos + 1; t < n8; t++) s->w16[t] = 0; /* the dot runs over whole groups of 8 */
         int64_t recip = (int64_t)(((uint64_t)1 << 62) / (uint64_t)sum);
-        for (int i = 0; i < NSLM_HEAD_DIM; i++) out[i] = sat32(rshr((int64_t)acc[i] * recip, 70 - sh));
+        for (int i = 0; i < NSLM_HEAD_DIM; i++) {
+            /* w16 >= 0 and u <= 255 with SEQ <= 1024 keep this below 2^31 */
+            int32_t acc = nslm_dot_s16_u8(s->w16, s->vt[l][kh][i], n8) - wsum * 128;
+            out[i] = sat32(rshr((int64_t)acc * recip, 70 - sh));
+        }
     }
 }
 
@@ -311,8 +313,8 @@ void nslm_forward(nslm_model *m, int token, int pos) {
         rope(s->q, NSLM_HEADS, rope_tab);
         rope(s->k, NSLM_KV_HEADS, rope_tab);
         for (int h = 0; h < NSLM_KV_HEADS; h++) {
-            s->ks[l][pos][h] = quant_kv(s->kc[l][pos] + h * NSLM_HEAD_DIM, s->k + h * NSLM_HEAD_DIM);
-            s->vs[l][pos][h] = quant_kv(s->vc[l][pos] + h * NSLM_HEAD_DIM, s->v + h * NSLM_HEAD_DIM);
+            s->ks[l][h][pos] = quant_kv(s->kc[l][h][pos], 1, s->k + h * NSLM_HEAD_DIM);
+            s->vs[l][h][pos] = quant_kv(&s->vt[l][h][0][pos], NSLM_SEQP, s->v + h * NSLM_HEAD_DIM);
         }
         attention(s, l, pos);
         ea = quant_act(s->a, s->xb, NSLM_DIM);
@@ -363,4 +365,43 @@ int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng) {
         if (acc > target) return i;
     }
     return n - 1;
+}
+
+int nslm_decode(int32_t *logits, int n, const nslm_policy *p, const int *hist, int nhist, uint32_t *rng) {
+    if (p->rep_q16 && nhist > 0) {
+        int w = p->window < nhist ? p->window : nhist;
+        if (w > NSLM_REP_MAX) w = NSLM_REP_MAX;
+        const int *h = hist + nhist - w;
+        for (int i = 0; i < w; i++) {
+            int t = h[i], seen = 0;
+            for (int j = 0; j < i && !seen; j++) seen = h[j] == t;
+            if (!seen && t >= 0 && t < n) logits[t] = sat32((int64_t)logits[t] - p->rep_q16);
+        }
+    }
+    if (p->temp_q8 <= 0) return nslm_argmax(logits, n);
+    int32_t mx = logits[nslm_argmax(logits, n)];
+    int64_t k = ((int64_t)94548 << 8) / p->temp_q8; /* log2(e) / T, Q16 */
+    /* z = (l - max) * log2(e) / T in Q16; min-p keeps z >= minp_q16 */
+    int32_t zmin = p->minp_q16 < 0 ? p->minp_q16 : INT32_MIN;
+    uint64_t sum = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t z = sat32(rshr((int64_t)(logits[i] - mx) * k, 16));
+        if (z >= zmin) sum += (uint32_t)exp2_q30(z);
+    }
+    uint32_t x = *rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *rng = x;
+    uint64_t target = ((sum >> 16) * (uint64_t)x) >> 16;
+    uint64_t acc = 0;
+    int last = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t z = sat32(rshr((int64_t)(logits[i] - mx) * k, 16));
+        if (z < zmin) continue;
+        last = i;
+        acc += (uint32_t)exp2_q30(z);
+        if (acc > target) return i;
+    }
+    return last;
 }

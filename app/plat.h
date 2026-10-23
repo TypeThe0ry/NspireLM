@@ -35,6 +35,7 @@ int plat_write(const char *name, const char *text);
 /* Real path of a data file next to the program ("model.nslm" -> "model.nslm.tns" on the device). */
 const char *plat_path(const char *name, char *buf, size_t n);
 void *plat_aligned_alloc(size_t bytes); /* 32-byte aligned, zeroed */
+void plat_aligned_free(void *p);
 int plat_battery_ok(void);              /* 1 = full speed (not on USB), 0 = throttled, -1 unknown */
 
 #endif

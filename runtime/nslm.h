@@ -20,6 +20,10 @@
 #endif
 
 #define NSLM_MAXV (NSLM_HIDDEN > NSLM_DIM ? NSLM_HIDDEN : NSLM_DIM)
+#define NSLM_SEQP ((NSLM_SEQ + 7) & ~7) /* value rows padded for 8-wide dot kernels */
+#if NSLM_HEAD_DIM % 8
+#error "attention dot kernels need head_dim % 8 == 0"
+#endif
 
 /* x4 layout (compiler/nslmc.py pack_x4): q is offset-binary uint8 in blocks of 4 rows x 8 columns
  * (one 32-byte cache line); m is [rows/4][groups][4]; e is per row. int4 matrices use the same struct
@@ -44,12 +48,14 @@ typedef struct {
     int16_t qh[NSLM_HEAD_DIM];
     int32_t z[NSLM_SEQ];
     int64_t w[NSLM_SEQ];
-    int16_t w16[NSLM_SEQ];
+    int16_t w16[NSLM_SEQP];
     int32_t logits[NSLM_VOCAB_ROWS]; /* only the first NSLM_VOCAB are real tokens */
-    int8_t kc[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_DIM];
-    int8_t vc[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_DIM];
-    int32_t ks[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_HEADS];
-    int32_t vs[NSLM_LAYERS][NSLM_SEQ][NSLM_KV_HEADS];
+    /* KV cache, offset-binary (q + 128), laid out so both attention products are contiguous dots:
+     * keys [head][pos][dim], values transposed [head][dim][pos] */
+    uint8_t kc[NSLM_LAYERS][NSLM_KV_HEADS][NSLM_SEQ][NSLM_HEAD_DIM];
+    uint8_t vt[NSLM_LAYERS][NSLM_KV_HEADS][NSLM_HEAD_DIM][NSLM_SEQP];
+    int32_t ks[NSLM_LAYERS][NSLM_KV_HEADS][NSLM_SEQ];
+    int32_t vs[NSLM_LAYERS][NSLM_KV_HEADS][NSLM_SEQ];
 } nslm_state;
 
 typedef struct {
@@ -74,6 +80,19 @@ int nslm_argmax(const int32_t *logits, int n);
 /* temp_q8: temperature in Q8 (256 = 1.0); 0 = greedy. rng: xorshift32 state. */
 int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng);
 
+/* Decoding policy, all integer:
+ *   temp_q8   temperature in Q8 (0 = greedy)
+ *   minp_q16  min-p in the log2 domain: keep tokens whose probability is >= 2^(minp_q16/65536) times the
+ *             best one (e.g. -4.32 * 65536 for min-p 0.05); 0 disables
+ *   rep_q16   presence penalty subtracted from the logit (Q16) of every token in the last `window` tokens
+ *   window    how many recent tokens the penalty looks at (<= NSLM_REP_MAX) */
+#define NSLM_REP_MAX 128
+typedef struct {
+    int temp_q8, minp_q16, rep_q16, window;
+} nslm_policy;
+/* logits is modified in place (penalty). hist: previous tokens, newest last. */
+int nslm_decode(int32_t *logits, int n, const nslm_policy *p, const int *hist, int nhist, uint32_t *rng);
+
 /* Kernels (portable C in nslm_kern.c; ARM assembly versions replace them on device).
  * out[r] = sat32(rshr(sum_g (d_rg * m_rg) >> 16, e_r + ea - 32)), d_rg = sum_{i in g} q_ri * a_i
  * asum[g] = sum_{i in g} a_i. rows % 4 == 0, cols % 8 == 0, gs % 8 == 0. */
@@ -82,6 +101,10 @@ void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, const int3
 /* Same contract for int4 weights in the x4n layout (codes u = q + 8). cols % 16 == 0, gs % 16 == 0. */
 void nslm_matmul_q4(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
                     int rows, int cols, int gs);
+/* sum_i a[i] * u[i] for n % 8 == 0 (attention: int16 query/weights against offset-binary KV bytes) */
+int32_t nslm_dot_s16_u8(const int16_t *a, const uint8_t *u, int n);
+/* out[r] = sum_i a[i] * u[r * n + i] for r < rows (all attention scores of one head) */
+void nslm_dots_s16_u8(int32_t *out, const int16_t *a, const uint8_t *u, int n, int rows);
 
 /* Tokenizer (tok.nslt). */
 typedef struct {

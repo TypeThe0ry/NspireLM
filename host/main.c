@@ -35,7 +35,7 @@ static void *slurp(const char *path, size_t *len) {
 }
 
 /* The cycle model (perf/arm926.c) prints counters each time this function's block executes. */
-__attribute__((noinline)) void nslm_perf_mark(int id) {
+__attribute__((noipa)) void nslm_perf_mark(int id) { /* noipa: no clone, so the plugin sees one address */
     __asm__ volatile("" ::: "memory");
     (void)id;
 }
@@ -64,6 +64,7 @@ int main(int argc, char **argv) {
     const char *prompt = "";
     int steps = 256, temp = 0;
     uint32_t seed = 42;
+    nslm_policy pol = {0, 0, 0, 64};
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--encode") && i + 1 < argc) {
             const char *text = argv[i + 1];
@@ -78,6 +79,12 @@ int main(int argc, char **argv) {
             int far = atoi(argv[i + 1]);
             if (far >= NSLM_SEQ) far = NSLM_SEQ - 1;
             nslm_forward(&model, 1, 7);
+            if (getenv("NSLM_BENCH_FAR_FIRST")) { /* profile the far position (perf/profile.py) */
+                nslm_perf_mark(0);
+                nslm_forward(&model, 301 % NSLM_VOCAB, far);
+                nslm_perf_mark(1);
+                return 0;
+            }
             nslm_perf_mark(0);
             nslm_forward(&model, 300 % NSLM_VOCAB, 8);
             nslm_perf_mark(1);
@@ -104,6 +111,39 @@ int main(int argc, char **argv) {
             steps = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-t") && i + 1 < argc) {
             temp = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--minp") && i + 1 < argc) {
+            pol.minp_q16 = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--rep") && i + 1 < argc) {
+            pol.rep_q16 = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--window") && i + 1 < argc) {
+            pol.window = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--gen") && i + 2 < argc) {
+            /* batch generation for tools/sample_eval.py: one prompt per line in, token ids per line out */
+            FILE *in = fopen(argv[i + 1], "r"), *out = fopen(argv[i + 2], "w");
+            static char line[2048];
+            static int ids[NSLM_SEQ + 8], hist[NSLM_SEQ + 8];
+            char *scr = malloc((size_t)tok.max_len * 2 + 8);
+            pol.temp_q8 = temp;
+            int story = 0;
+            while (in && out && fgets(line, sizeof line, in)) {
+                line[strcspn(line, "\n")] = 0;
+                int np = nslm_tok_encode(&tok, line, ids, scr), nh = 0, cur = ids[0];
+                uint32_t rng = seed * 2654435761u + (uint32_t)story++ * 40503u + 1u;
+                memset(state, 0, sizeof *state);
+                for (int p = 0; p < steps && p < NSLM_SEQ; p++) {
+                    nslm_forward(&model, cur, p);
+                    hist[nh++] = cur;
+                    int next = p + 1 < np ? ids[p + 1] : nslm_decode(state->logits, NSLM_VOCAB, &pol, hist, nh, &rng);
+                    if (p + 1 >= np) {
+                        if (next == 1 || next == 2) break;
+                        fprintf(out, "%d ", next);
+                    }
+                    cur = next;
+                }
+                fprintf(out, "\n");
+            }
+            if (out) fclose(out);
+            return 0;
         } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             seed = (uint32_t)strtoul(argv[++i], 0, 10);
         }
@@ -117,7 +157,8 @@ int main(int argc, char **argv) {
     int pos = 0;
     for (; pos < steps; pos++) {
         nslm_forward(&model, cur, pos);
-        int next = pos + 1 < np ? ptoks[pos + 1] : nslm_sample(state->logits, NSLM_VOCAB, temp, &seed);
+        pol.temp_q8 = temp;
+        int next = pos + 1 < np ? ptoks[pos + 1] : nslm_decode(state->logits, NSLM_VOCAB, &pol, ptoks, 0, &seed);
         if (next == 1) break; /* BOS ends a story */
         int len;
         char bb[2];
