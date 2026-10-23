@@ -74,6 +74,19 @@ int nslm_argmax(const int32_t *logits, int n);
 /* temp_q8: temperature in Q8 (256 = 1.0); 0 = greedy. rng: xorshift32 state. */
 int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng);
 
+/* Decoding policy, all integer:
+ *   temp_q8   temperature in Q8 (0 = greedy)
+ *   minp_q16  min-p in the log2 domain: keep tokens whose probability is >= 2^(minp_q16/65536) times the
+ *             best one (e.g. -4.32 * 65536 for min-p 0.05); 0 disables
+ *   rep_q16   presence penalty subtracted from the logit (Q16) of every token in the last `window` tokens
+ *   window    how many recent tokens the penalty looks at (<= NSLM_REP_MAX) */
+#define NSLM_REP_MAX 128
+typedef struct {
+    int temp_q8, minp_q16, rep_q16, window;
+} nslm_policy;
+/* logits is modified in place (penalty). hist: previous tokens, newest last. */
+int nslm_decode(int32_t *logits, int n, const nslm_policy *p, const int *hist, int nhist, uint32_t *rng);
+
 /* Kernels (portable C in nslm_kern.c; ARM assembly versions replace them on device).
  * out[r] = sat32(rshr(sum_g (d_rg * m_rg) >> 16, e_r + ea - 32)), d_rg = sum_{i in g} q_ri * a_i
  * asum[g] = sum_{i in g} a_i. rows % 4 == 0, cols % 8 == 0, gs % 8 == 0. */

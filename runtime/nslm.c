@@ -364,3 +364,42 @@ int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng) {
     }
     return n - 1;
 }
+
+int nslm_decode(int32_t *logits, int n, const nslm_policy *p, const int *hist, int nhist, uint32_t *rng) {
+    if (p->rep_q16 && nhist > 0) {
+        int w = p->window < nhist ? p->window : nhist;
+        if (w > NSLM_REP_MAX) w = NSLM_REP_MAX;
+        const int *h = hist + nhist - w;
+        for (int i = 0; i < w; i++) {
+            int t = h[i], seen = 0;
+            for (int j = 0; j < i && !seen; j++) seen = h[j] == t;
+            if (!seen && t >= 0 && t < n) logits[t] = sat32((int64_t)logits[t] - p->rep_q16);
+        }
+    }
+    if (p->temp_q8 <= 0) return nslm_argmax(logits, n);
+    int32_t mx = logits[nslm_argmax(logits, n)];
+    int64_t k = ((int64_t)94548 << 8) / p->temp_q8; /* log2(e) / T, Q16 */
+    /* z = (l - max) * log2(e) / T in Q16; min-p keeps z >= minp_q16 */
+    int32_t zmin = p->minp_q16 < 0 ? p->minp_q16 : INT32_MIN;
+    uint64_t sum = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t z = sat32(rshr((int64_t)(logits[i] - mx) * k, 16));
+        if (z >= zmin) sum += (uint32_t)exp2_q30(z);
+    }
+    uint32_t x = *rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *rng = x;
+    uint64_t target = ((sum >> 16) * (uint64_t)x) >> 16;
+    uint64_t acc = 0;
+    int last = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t z = sat32(rshr((int64_t)(logits[i] - mx) * k, 16));
+        if (z < zmin) continue;
+        last = i;
+        acc += (uint32_t)exp2_q30(z);
+        if (acc > target) return i;
+    }
+    return last;
+}
