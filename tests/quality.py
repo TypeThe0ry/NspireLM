@@ -46,7 +46,10 @@ def main():
     a = ap.parse_args()
 
     ck = nslmc.Ckpt(a.ckpt)
-    tok = nslmc.Tokenizer(a.tokenizer, ck.vocab)
+    if a.tokenizer.endswith(".json"):  # byte-level BPE chat model (train/export.py)
+        tok = nslmc.BLModelTok(a.tokenizer, ck.meta["keep"])
+    else:
+        tok = nslmc.Tokenizer(a.tokenizer, ck.vocab)
     if a.vocab_usage:
         counts = np.load(a.vocab_usage)
         tok.set_keep(sorted(set(np.nonzero(counts >= a.min_count)[0].tolist()) | {0, 1, 2} | set(range(3, 259))))
@@ -54,9 +57,16 @@ def main():
     nv = len(keep)
     exe = shlex.split(a.runner) + [a.bin or os.path.join(a.build, "nslm_host"),
                                     os.path.join(a.build, "model.nslm"), os.path.join(a.build, "tok.nslt")]
-    with open(a.valid, encoding="utf-8") as f:
-        stories = [s.strip() for s in f.read().split("<|endoftext|>") if s.strip()][: a.stories]
+    if a.valid == "smoltalk":  # held-out chats: question and answer as plain text
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "train"))
+        from data import load_chats
+        stories = ["\n".join(m["content"] for m in c) for c in load_chats("test", a.stories, seed=5)]
+    else:
+        with open(a.valid, encoding="utf-8") as f:
+            stories = [s.strip() for s in f.read().split("<|endoftext|>") if s.strip()][: a.stories]
 
+    if ck.qat is not None:  # QAT student: the reference is the int4 model training optimised
+        ck.fake_quant()
     fm = nslmc.FloatModel(ck)
     tot = dict(n=0, top1=0, kl=0.0, nll_f=0.0, nll_i=0.0)
     tok_mismatch = 0

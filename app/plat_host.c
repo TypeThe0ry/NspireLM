@@ -31,7 +31,13 @@ uint64_t plat_us(void) {
 
 int plat_cpu_mhz(void) { return 0; }
 int plat_battery_ok(void) { return -1; }
-int plat_abort(void) { return 0; }
+/* NSLM_ABORT_AFTER=N: behave as if ESC were held once a generation has polled N times (keeps scripted
+ * runs of models that never stop short) */
+static int abort_polls;
+int plat_abort(void) {
+    const char *e = getenv("NSLM_ABORT_AFTER");
+    return e && ++abort_polls > atoi(e);
+}
 
 static void shot(void) {
     if (!last_fb) return;
@@ -50,6 +56,7 @@ static void shot(void) {
 }
 
 int plat_key(void) {
+    abort_polls = 0;
     static const struct { const char *name; int key; } named[] = {
         {"{ENTER}", K_ENTER}, {"{ESC}", K_ESC}, {"{MENU}", K_MENU}, {"{TAB}", K_TAB}, {"{DEL}", K_DEL}};
     for (;;) {

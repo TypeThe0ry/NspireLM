@@ -107,3 +107,34 @@ DRAM ceiling. 10% is attention, near its KV-traffic floor.
   NAND (~5 s) dominates time to first token.
 - The remaining speed levers reduce bytes per token: int4 weights (stories15M all-int4: 9.0 tok/s at +11%
   perplexity) or a smaller vocabulary.
+
+## Chat model (question answering)
+
+The story models only continue text. For answering questions, the target is a distilled SmolLM2 student
+(`train/README.md`). The measurements behind that choice, on held-out smol-smoltalk chats:
+
+| Candidate | Size that fits 27 MiB? | Answers (float, greedy) |
+|---|---|---|
+| SmolLM2-135M-Instruct | No: ≈60 MB int4. Perplexity on chat answers is 2.18 in float, 2.58 with int4 GPTQ, 3.85 with int3, and above 10⁴ with int2 | correct (Paris, photosynthesis, Shakespeare) |
+| Smol-Llama-101M-Chat | No | often wrong ("a spider has 10 legs") |
+| Minueza-32M-UltraChat | Yes | mostly confabulated |
+| **Student: 9 SmolLM2 layers, 16k vocabulary, QAT int4** | **Yes: 21.1 MiB** | distilled from SmolLM2 |
+
+Runtime support added for it:
+
+- **Byte-level BPE** (`compiler/bltok.py`, `runtime/nslm_tok.c`, `NSLM_TOK_BL`). A hand-written
+  pretokenizer replaces regexes: HF `Digits(individual)` followed by the GPT-2 split, then rank-ordered
+  merges. `tests/test_bltok.py` checks it against HF on 2816 strings (ASCII and non-ASCII), and the C encoder
+  against Python. Tokens outside the kept 16k vocabulary are split along their own BPE merges, exactly as in
+  training.
+- **GQA 9/3, RoPE θ = 1e5, learned-scale int4.** QAT trains the scale of every 64-weight group on the
+  runtime's grid (codes −8..7). The compiler takes those scales (`student.bin.qat.npz`) instead of searching
+  for its own, so the device computes the model that training optimised.
+- **Chat app.** Turns are encoded as ChatML without a system prompt and share one KV cache across turns.
+  A new conversation starts when the context (320 positions) is full, or when enter is pressed on an empty
+  line.
+
+Fidelity of the integer engine on this architecture: compiled in int8, the *full* 30-layer SmolLM2 matches
+float32 at 97.7% top-1, KL 0.0013, perplexity 2.998 → 2.991 (765 chat positions). The 9-layer int4
+student is predicted at **2.30 tok/s** (position 8) and 2.06 tok/s (position 255) on a 396 MHz CX II by the
+cycle model.

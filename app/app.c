@@ -200,6 +200,108 @@ static void generate(const char *prompt) {
     idle_status();
 }
 
+/* Chat mode (byte-level tokenizer, ChatML, train/distill.py): every turn continues the same KV cache:
+ *   <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n{answer}<|im_end|>\n
+ * When the next turn would not fit in NSLM_SEQ positions, the conversation restarts. Enter on an empty
+ * line also starts a new conversation. */
+static int chat_pos;
+static int chat_last; /* the last token fed (its logits are not needed) */
+static int chat_hist[NSLM_SEQ + 8];
+
+static int chat_feed(const int *ids, int n) {
+    for (int i = 0; i < n; i++) {
+        if (chat_pos >= NSLM_SEQ) return -1;
+        nslm_forward(&model, ids[i], chat_pos);
+        chat_hist[chat_pos++] = ids[i];
+        chat_last = ids[i];
+    }
+    return 0;
+}
+
+static int chat_text_ids(const char *s, int *out) {
+    static char scratch[512];
+    return nslm_tok_encode(&tok, s, out, scratch);
+}
+
+static void chat_reset(void) {
+    chat_pos = 0;
+    memset(state, 0, sizeof *state);
+}
+
+static void chat(const char *question) {
+    static int ids[sizeof input + NSLM_SEQ + 16];
+    const int im_start = nslm_tok_special(&tok, 1), im_end = nslm_tok_special(&tok, 2),
+              eot = nslm_tok_special(&tok, 0);
+    if (!question[0]) {
+        chat_reset();
+        if (text_len) appends("\n\n");
+        appends("(new conversation)");
+        idle_status();
+        return;
+    }
+    int n = 0;
+    ids[n++] = im_start;
+    n += chat_text_ids("user\n", ids + n);
+    n += chat_text_ids(question, ids + n);
+    ids[n++] = im_end;
+    n += chat_text_ids("\n", ids + n);
+    ids[n++] = im_start;
+    n += chat_text_ids("assistant\n", ids + n);
+    /* keep room for a useful answer; otherwise start over */
+    if (chat_pos + n + 48 > NSLM_SEQ) {
+        int fresh = chat_pos > 0;
+        chat_reset();
+        if (n + 16 > NSLM_SEQ) {
+            appends("\n\n(question too long)");
+            idle_status();
+            return;
+        }
+        if (fresh) appends("\n\n(context full: new conversation)");
+    }
+    if (text_len) appends("\n\n");
+    prompt_start = text_len;
+    appends("Q: ");
+    appends(question);
+    prompt_end = text_len;
+    appends("\nA: ");
+    set_status("reading the question...  esc:stop");
+    draw();
+    uint64_t t0 = plat_us();
+    for (int i = 0; i < n; i++) {
+        if (plat_abort()) break;
+        chat_feed(ids + i, 1);
+        char st[96];
+        snprintf(st, sizeof st, "reading the question %d/%d  esc:stop", i + 1, n);
+        set_status(st);
+        draw();
+    }
+    int generated = 0;
+    uint64_t tgen = plat_us();
+    (void)t0;
+    while (chat_pos < NSLM_SEQ && !plat_abort()) {
+        int next = nslm_decode(state->logits, NSLM_VOCAB, &presets[preset].p, chat_hist, chat_pos, &rng);
+        if (next == im_end || next == eot || next == im_start) break;
+        int len;
+        char bb[2];
+        const char *piece = nslm_tok_piece(&tok, chat_last, next, &len, bb);
+        append(piece, len);
+        generated++;
+        if (chat_feed(&next, 1)) break;
+        char st[96];
+        uint64_t dt = plat_us() - tgen;
+        unsigned tps100 = (unsigned)((uint64_t)generated * 100000000ull / (dt ? dt : 1));
+        snprintf(st, sizeof st, "%d tok  %u.%02u tok/s  esc:stop", generated, tps100 / 100, tps100 % 100);
+        set_status(st);
+        draw();
+    }
+    /* close the turn so the next question continues the conversation */
+    int tail[4], nt = 0;
+    tail[nt++] = im_end;
+    nt += chat_text_ids("\n", tail + nt);
+    if (chat_feed(tail, nt)) chat_reset();
+    idle_status();
+}
+
 /* ------------------------------------------------------------------ self-test */
 
 static uint32_t fnv(uint32_t h, const void *p, size_t n) {
@@ -312,6 +414,7 @@ static void selftest(void) {
 #endif
     report(r, sizeof r, "model=%ld params_q8_kb=%ld\n", (long)NSLM_DIM, (long)(NSLM_BLOB_BYTES >> 10));
     appends(r);
+    chat_reset(); /* the self-test overwrote the KV cache */
     int ok = plat_write("nslm_selftest.txt", r);
     appends(ok == 0 ? "saved nslm_selftest.txt\n" : "could not save the report\n");
     idle_status();
@@ -396,7 +499,8 @@ int nslm_app_main(int argc, char **argv, int hash_only) {
     snprintf(info, sizeof info, "model: %d layers, dim %d, %d tokens, %ld KB\n", NSLM_LAYERS, NSLM_DIM,
              NSLM_VOCAB, (long)(mlen >> 10));
     appends(info);
-    appends("Type the start of a story and press enter.\n");
+    appends(tok.kind == NSLM_TOK_BL ? "Ask a question and press enter.\nEnter on an empty line: new conversation.\n"
+                                    : "Type the start of a story and press enter.\n");
     idle_status();
     draw();
 
@@ -405,7 +509,8 @@ int nslm_app_main(int argc, char **argv, int hash_only) {
         if (k == K_NONE) continue;
         if (k == K_ESC) break;
         if (k == K_ENTER) {
-            generate(input);
+            if (tok.kind == NSLM_TOK_BL) chat(input);
+            else generate(input);
             input_len = 0;
             input[0] = 0;
         } else if (k == K_DEL) {

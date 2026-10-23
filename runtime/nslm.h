@@ -106,19 +106,35 @@ int32_t nslm_dot_s16_u8(const int16_t *a, const uint8_t *u, int n);
 /* out[r] = sum_i a[i] * u[r * n + i] for r < rows (all attention scores of one head) */
 void nslm_dots_s16_u8(int32_t *out, const int16_t *a, const uint8_t *u, int n, int rows);
 
-/* Tokenizer (tok.nslt). */
+/* Tokenizer (tok.nslt). Two kinds:
+ *   NSLM_TOK_SP  llama2.c sentencepiece-style BPE (magic "NSLT"): merge scores as integer ranks
+ *   NSLM_TOK_BL  GPT-2 byte-level BPE (magic "NSLB", compiler/bltok.py): pretokenizer + merge ranks, then
+ *                compiled-out tokens split along their own merges */
+enum { NSLM_TOK_SP = 0, NSLM_TOK_BL = 1 };
 typedef struct {
-    int n, max_len, n_model;           /* full BPE vocab, longest piece, model vocab */
+    int kind;
+    int n, max_len, n_model;           /* full BPE vocab, longest piece (SP), model vocab */
     const int32_t *rank;
     const uint32_t *off, *sorted;
     const int32_t *old2new, *new2old; /* BPE id <-> model id (-1: compiled out) */
     const char *str;
+    /* NSLM_TOK_BL */
+    int n_merges;
+    const int32_t *byte_tok;          /* byte -> full id of its byte symbol */
+    const uint32_t *mkey;             /* sorted (left << 16) | right */
+    const uint16_t *mrank, *mout;
+    const uint32_t *poff, *soff;      /* full id -> model pieces; model id -> bytes */
+    const uint16_t *piece;
+    const uint8_t *sbytes;
 } nslm_tok;
 
 int nslm_tok_bind(nslm_tok *t, const void *image, size_t len);
-/* Returns the number of model-vocabulary tokens written (BOS first); out must hold strlen(text) + 3
- * entries and scratch 2 * max_len + 8 bytes. Pieces the model was compiled without are re-segmented. */
+/* Returns the number of model-vocabulary tokens written; out must hold strlen(text) + 3 entries and
+ * scratch 2 * max_len + 8 bytes. SP: BOS first. BL: plain text, no special tokens (the chat wrapper adds
+ * them). Pieces the model was compiled without are re-segmented. */
 int nslm_tok_encode(const nslm_tok *t, const char *text, int *out, char *scratch);
+/* BL only: model id of a full-vocabulary id (special tokens: 0 <|endoftext|>, 1 <|im_start|>, 2 <|im_end|>) */
+int nslm_tok_special(const nslm_tok *t, int full_id);
 /* Decoded bytes of `tok` following `prev`; *n receives the length. */
 const char *nslm_tok_piece(const nslm_tok *t, int prev, int tok, int *n, char byte_buf[2]);
 
