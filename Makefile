@@ -9,7 +9,7 @@ WARN = -std=c11 -Wall -Wextra -Werror -Wno-unused-function
 SRC = runtime/nslm.c runtime/nslm_kern.c runtime/nslm_tok.c host/main.c
 INC = -Iruntime -I$(MODEL)
 
-ASM = runtime/arm/matmul_q8.S
+ASM = runtime/arm/matmul_q8.S runtime/arm/matmul_q4.S
 
 host: $(MODEL)/nslm_host
 arm: $(MODEL)/nslm_arm $(MODEL)/nslm_armc
@@ -28,11 +28,19 @@ $(MODEL)/nslm_armc: $(SRC) runtime/nslm.h $(MODEL)/nslm_model.h
 APP = app/app.c app/font8x8.c
 RT = runtime/nslm.c runtime/nslm_kern.c runtime/nslm_tok.c
 
-# Headless app (scripted keys, frames to PPM) and the expected self-test hash it bakes in
-app-host: $(MODEL)/nslm_app
-$(MODEL)/nslm_app: $(RT) $(APP) app/plat_host.c app/plat.h runtime/nslm.h $(MODEL)/nslm_model.h
-	$(CC) $(CFLAGS) $(WARN) -D_POSIX_C_SOURCE=200112L $(INC) $(RT) $(APP) app/plat_host.c -o $@
-$(MODEL)/nslm_test.h: $(MODEL)/nslm_app $(MODEL)/model.nslm
-	echo "#define NSLM_TEST_HASH 0x$$(NSLM_DIR=$(MODEL) $(MODEL)/nslm_app --hash)u" > $@
+# Headless app (scripted keys, frames to PPM). The expected self-test hash is produced by a build
+# without it (nslm_hashgen) and baked into every app build, so the self-test proves bit-exactness.
+APPSRC = $(RT) $(APP) app/plat_host.c
+APPDEP = $(APPSRC) app/plat.h runtime/nslm.h $(MODEL)/nslm_model.h
+app-host: $(MODEL)/nslm_app $(MODEL)/nslm_app_arm
+$(MODEL)/nslm_hashgen: $(APPDEP)
+	$(CC) $(CFLAGS) $(WARN) -D_POSIX_C_SOURCE=200112L -DNSLM_NO_TEST_H $(INC) $(APPSRC) -o $@
+$(MODEL)/nslm_test.h: $(MODEL)/nslm_hashgen $(MODEL)/model.nslm
+	echo "#define NSLM_TEST_HASH 0x$$(NSLM_DIR=$(MODEL) $(MODEL)/nslm_hashgen --hash)u" > $@
+$(MODEL)/nslm_app: $(APPDEP) $(MODEL)/nslm_test.h
+	$(CC) $(CFLAGS) $(WARN) -D_POSIX_C_SOURCE=200112L $(INC) $(APPSRC) -o $@
+$(MODEL)/nslm_app_arm: $(APPDEP) $(ASM) $(MODEL)/nslm_test.h
+	$(ARMCC) $(CFLAGS) $(WARN) -D_POSIX_C_SOURCE=200112L -DNSLM_HAVE_ASM_MATMUL -mcpu=arm926ej-s -marm -static \
+	  $(INC) $(APPSRC) $(ASM) -o $@
 
 .PHONY: host arm app-host

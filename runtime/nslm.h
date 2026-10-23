@@ -22,7 +22,8 @@
 #define NSLM_MAXV (NSLM_HIDDEN > NSLM_DIM ? NSLM_HIDDEN : NSLM_DIM)
 
 /* x4 layout (compiler/nslmc.py pack_x4): q is offset-binary uint8 in blocks of 4 rows x 8 columns
- * (one 32-byte cache line); m is [rows/4][groups][4]; e is per row. */
+ * (one 32-byte cache line); m is [rows/4][groups][4]; e is per row. int4 matrices use the same struct
+ * with the x4n layout (pack_x4n: 4 rows x 16 columns per line). */
 typedef struct {
     const uint8_t *q;
     const uint16_t *m;
@@ -52,7 +53,7 @@ typedef struct {
 } nslm_state;
 
 typedef struct {
-    nslm_q8 emb, cls;
+    nslm_q8 emb[NSLM_EMB_PARTS], cls[NSLM_EMB_PARTS]; /* row parts of NSLM_EMB_PART_ROWS rows */
     nslm_layer layer[NSLM_LAYERS];
     const int32_t *rms_final;
     const int32_t *rope; /* [SEQ][HEAD_DIM/2][2] cos, sin in Q30 */
@@ -61,6 +62,9 @@ typedef struct {
 
 /* Binds a loaded model.nslm image (must stay alive and be 32-byte aligned). 0 on success. */
 int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state);
+/* Same, with the file split at nslm_seg_off[] into NSLM_NSEG separately allocated, 32-byte aligned
+ * segments (segs[k] holds file bytes nslm_seg_off[k] .. nslm_seg_off[k+1]). */
+int nslm_bind_segments(nslm_model *m, const void *const *segs, nslm_state *state);
 
 /* One decoding step. Leaves Q16 logits in m->s->logits. */
 void nslm_forward(nslm_model *m, int token, int pos);
@@ -74,6 +78,9 @@ int nslm_sample(const int32_t *logits, int n, int temp_q8, uint32_t *rng);
  * out[r] = sat32(rshr(sum_g (d_rg * m_rg) >> 16, e_r + ea - 32)), d_rg = sum_{i in g} q_ri * a_i
  * asum[g] = sum_{i in g} a_i. rows % 4 == 0, cols % 8 == 0, gs % 8 == 0. */
 void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
+                    int rows, int cols, int gs);
+/* Same contract for int4 weights in the x4n layout (codes u = q + 8). cols % 16 == 0, gs % 16 == 0. */
+void nslm_matmul_q4(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
                     int rows, int cols, int gs);
 
 /* Tokenizer (tok.nslt). */
