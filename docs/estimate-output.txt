@@ -1,0 +1,55 @@
+== 1. RAM capacity (M params) ==
+  single block  {'int8': 18.3, 'int4': 36.6, 'ternary': 75.4}
+  chunked heap  {'int8': 23.8, 'int4': 47.6, 'ternary': 98.1}
+
+== 2. Per-token time (dense, params all touched once per token) ==
+    0.26M  C-int8  23.76 | 2x-int8  26.87 | asm-int8  27.58 (mem) | asm-int4  29.15 (cpu) | asm-ternary  29.72 (cpu) |
+    1.00M  C-int8  14.32 | 2x-int8  19.58 | asm-int8  21.09 (mem) | asm-int4  25.05 (cpu) | asm-ternary  26.75 (cpu) |
+    3.00M  C-int8   6.91 | 2x-int8  11.29 | asm-int8  12.89 (mem) | asm-int4  18.16 (cpu) | asm-ternary  21.06 (cpu) |
+    7.00M  C-int8   3.39 | 2x-int8   6.12 | asm-int8   7.26 (mem) | asm-int4  11.71 (cpu) | asm-ternary  14.77 (cpu) |
+   11.00M  C-int8   2.25 | 2x-int8   4.19 | asm-int8   5.05 (mem) | asm-int4   8.65 (cpu) | asm-ternary  11.38 (cpu) |
+   15.00M  C-int8   1.68 | 2x-int8   3.19 | asm-int8   3.87 (mem) | asm-int4   6.85 (cpu) | asm-ternary   9.25 (cpu) |
+   20.00M  C-int8   1.28 | 2x-int8   2.46 | asm-int8   3.00 (mem) | asm-int4   5.44 (cpu) | asm-ternary   7.50 (cpu) |
+   25.00M  C-int8   1.03 | 2x-int8   2.00 | asm-int8   2.44 (mem) | asm-int4   4.51 (cpu) | asm-ternary   6.31 (cpu) |
+   45.00M  C-int8   0.58 | 2x-int8   1.14 | asm-int8   1.41 (mem) | asm-int4   2.68 (cpu) | asm-ternary   3.85 (cpu) |
+   90.00M  C-int8   0.29 | 2x-int8   0.58 | asm-int8   0.72 (mem) | asm-int4   1.40 (cpu) | asm-ternary   2.05 (cpu) |
+
+  largest model at >=0.5 tok/s (budget 2.0 s):
+    C-int8 (ChatTLM-calibrated): 53M (but RAM caps int8 at ~24M)
+    2x-int8 (realistic target):  105M
+    asm-int8: 131M
+    asm-int4: 260M
+    asm-ternary: 390M
+
+== 3. Streaming weights from NAND ==
+  int8   : at 0.5 tok/s only 2.75M streamed params/token; 90 MB file = 85M params -> 62 s/token
+  int4   : at 0.5 tok/s only 5.50M streamed params/token; 90 MB file = 169M params -> 62 s/token
+  ternary: at 0.5 tok/s only 11.33M streamed params/token; 90 MB file = 349M params -> 62 s/token
+
+== 4. PLE (per-layer embedding) table ==
+  L=6 d_ple=128: row 396 B; one contiguous row per token
+     V=  8192 in RAM :    3.1 MiB,   6.3M params, +0 ms/token
+     V= 32768 in RAM :   12.4 MiB,  25.2M params, +0 ms/token
+     V= 32768 in NAND:   12.4 MiB,  25.2M params, +58 ms/token
+     V= 65536 in NAND:   24.8 MiB,  50.3M params, +58 ms/token
+  L=8 d_ple=128: row 528 B; one contiguous row per token
+     V=  8192 in RAM :    4.1 MiB,   8.4M params, +0 ms/token
+     V= 32768 in RAM :   16.5 MiB,  33.6M params, +0 ms/token
+     V= 32768 in NAND:   16.5 MiB,  33.6M params, +58 ms/token
+     V= 65536 in NAND:   33.0 MiB,  67.1M params, +58 ms/token
+  L=8 d_ple=256: row 1040 B; one contiguous row per token
+     V=  8192 in RAM :    8.1 MiB,  16.8M params, +0 ms/token
+     V= 32768 in RAM :   32.5 MiB,  67.1M params, +0 ms/token
+     V= 32768 in NAND:   32.5 MiB,  67.1M params, +58 ms/token
+     V= 65536 in NAND:   65.0 MiB, 134.2M params, +58 ms/token
+
+== 5. KV cache, vocab ==
+  L= 6 d=352: ctx256 int8 1.03 / fp32 4.1 MiB, ctx512 int8 2.06 / fp32 8.2 MiB, ctx1024 int8 4.12 / fp32 16.5 MiB
+  L= 8 d=384: ctx256 int8 1.50 / fp32 6.0 MiB, ctx512 int8 3.00 / fp32 12.0 MiB, ctx1024 int8 6.00 / fp32 24.0 MiB
+  L= 8 d=512: ctx256 int8 2.00 / fp32 8.0 MiB, ctx512 int8 4.00 / fp32 16.0 MiB, ctx1024 int8 8.00 / fp32 32.0 MiB
+  L=12 d=512: ctx256 int8 3.00 / fp32 12.0 MiB, ctx512 int8 6.00 / fp32 24.0 MiB, ctx1024 int8 12.00 / fp32 48.0 MiB
+  vocab   128 x d384: 0.05M params, classifier 0.05M MAC/token
+  vocab  2048 x d384: 0.79M params, classifier 0.79M MAC/token
+  vocab  4096 x d384: 1.57M params, classifier 1.57M MAC/token
+  vocab  8192 x d512: 4.19M params, classifier 4.19M MAC/token
+  vocab 32000 x d288: 9.22M params, classifier 9.22M MAC/token
