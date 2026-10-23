@@ -5,9 +5,12 @@ set -euo pipefail
 NDLESS_DIR=${NDLESS_DIR:-$HOME/ndless}
 REV=9484d8da7c7a4dde9766138c2e42e1d1e3acfcd4
 if [ ! -d "$NDLESS_DIR/.git" ]; then
-  git clone -q https://github.com/ndless-nspire/Ndless.git "$NDLESS_DIR"
+  # the directory may already exist: CI restores the cached toolchain into it before this runs
+  mkdir -p "$NDLESS_DIR"
+  git -C "$NDLESS_DIR" init -q
+  git -C "$NDLESS_DIR" remote add origin https://github.com/ndless-nspire/Ndless.git
 fi
-git -C "$NDLESS_DIR" fetch -q origin "$REV" 2>/dev/null || true
+git -C "$NDLESS_DIR" fetch -q origin "$REV"
 git -C "$NDLESS_DIR" checkout -q "$REV"
 git -C "$NDLESS_DIR" submodule update -q --init --recursive
 SDK=$NDLESS_DIR/ndless-sdk
