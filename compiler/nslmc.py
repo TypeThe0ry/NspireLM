@@ -15,6 +15,7 @@ Everything that can be decided before the calculator runs is decided here:
 The runtime therefore contains no floating point at all.
 """
 import argparse
+import json
 import math
 import os
 import struct
@@ -66,6 +67,24 @@ class Ckpt:
         take(seq, hd // 2)  # freq_cis_imag
         self.wcls = self.tok_emb if self.shared else take(vocab, dim)
         assert off == data.size or not self.shared, (off, data.size)
+        # optional sidecars written by train/export.py: <ckpt>.json (rope_theta, tokenizer) and
+        # <ckpt>.qat.npz (learned int4 group scales, so the weights compile without re-rounding)
+        meta = path + ".json"
+        self.meta = json.load(open(meta)) if os.path.exists(meta) else {}
+        self.rope_theta = float(self.meta.get("rope_theta", 10000.0))
+        qs = path + ".qat.npz"
+        self.qat = dict(np.load(qs)) if os.path.exists(qs) else None
+
+    def fake_quant(self):
+        """Replace the weights by the int4 values QAT trained with (round(w / s) on the learned scales, in
+        float32 like torch), so FloatModel is the reference for what the device should compute."""
+        def fq(w, S):
+            gs = w.shape[1] // S.shape[1]
+            q = np.clip(np.round(w.reshape(w.shape[0], -1, gs) / S[:, :, None]), -8, 7)
+            return (q * S[:, :, None]).reshape(w.shape).astype(np.float32)
+        for k in ("wq", "wk", "wv", "wo", "w1", "w2", "w3"):
+            setattr(self, k, np.stack([fq(getattr(self, k)[l], self.qat[f"l{l}_{k}"]) for l in range(self.n_layers)]))
+        self.tok_emb = self.wcls = fq(self.tok_emb, self.qat["emb"])
 
 
 # --------------------------------------------------------------------------- tokenizer
@@ -177,12 +196,31 @@ class Tokenizer:
             f.write(blob)
 
 
+class BLModelTok:
+    """compile_model's tokenizer interface for a byte-level BPE whose kept tokens (teacher ids, in model-id
+    order) are already the checkpoint's rows."""
+
+    def __init__(self, tokenizer_json, keep):
+        import bltok
+        self.bl = bltok.ByteLevelBPE(tokenizer_json, keep)
+        self.new2old = list(range(len(self.bl.keep)))
+
+    def set_keep(self, keep):
+        assert keep is None, "vocabulary pruning happens in training for byte-level models"
+
+    def encode(self, text):
+        return self.bl.encode(text)
+
+    def write_nslt(self, path):
+        self.bl.write_nslt(path)
+
+
 # --------------------------------------------------------------------------- float reference
 
-def rope_angles(seq, head_dim):
+def rope_angles(seq, head_dim, theta=10000.0):
     """Exactly run.c's formula, in float32 like run.c."""
     i = np.arange(0, head_dim, 2, dtype=np.float32)
-    freq = (1.0 / np.power(np.float32(10000.0), i / np.float32(head_dim))).astype(np.float32)
+    freq = (1.0 / np.power(np.float32(theta), i / np.float32(head_dim))).astype(np.float32)
     pos = np.arange(seq, dtype=np.float32)[:, None]
     return (pos * freq[None, :]).astype(np.float32)
 
@@ -192,7 +230,7 @@ class FloatModel:
 
     def __init__(self, ck):
         self.ck = ck
-        ang = rope_angles(ck.seq, ck.head_dim)
+        ang = rope_angles(ck.seq, ck.head_dim, ck.rope_theta)
         self.cos, self.sin = np.cos(ang), np.sin(ang)
         self.reset()
 
@@ -294,11 +332,18 @@ def scales_to_me(S, Q):
         e = np.where(bad, e - 1, e)
 
 
-def quant_q4(w, gs, X=None):
-    """Group-wise int4 (codes -8..7). With calibration inputs X, GPTQ rounding; otherwise
-    round-to-nearest with a per-group MSE clipping search."""
+def quant_q4(w, gs, X=None, S=None):
+    """Group-wise int4 (codes -8..7). With learned scales S [rows, groups] (quantisation-aware training)
+    the codes are round(w / S); with calibration inputs X, GPTQ rounding; otherwise round-to-nearest with
+    a per-group MSE clipping search."""
     import gptq
-    if X is not None:
+    if S is not None:
+        r, c = w.shape
+        S = S.astype(np.float64)
+        assert S.shape == (r, c // gs), (S.shape, w.shape, gs)
+        Q = np.clip(np.round(w.astype(np.float64).reshape(r, c // gs, gs) / S[:, :, None]), -8, 7)
+        Q = Q.reshape(r, c).astype(np.int64)
+    elif X is not None:
         Q, S = gptq.gptq_quant(w, X, 4, gs)
     else:
         r, c = w.shape
@@ -390,12 +435,22 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None, bits_att=8, bits_ffn=8
     q8 = []
     g4_d, g4_h = pick_gs16(ck.dim, gs4), pick_gs16(hid, gs4)
 
-    def add_mat(name, w, bits=8, X=None):
+    def qat_s(name, w, scale=1.0):
+        """learned scales for this matrix, padded like the weights (padding gets a dummy scale)"""
+        if ck.qat is None:
+            return None
+        S = ck.qat[name].astype(np.float64) * scale
+        gs = g4_d if w.shape[1] == ck.dim else g4_h
+        P = np.ones((w.shape[0], w.shape[1] // gs))
+        P[:S.shape[0], :S.shape[1]] = S
+        return P
+
+    def add_mat(name, w, bits=8, X=None, S=None):
         assert (w.shape[1] == ck.dim) or (w.shape[1] == hid)
         if bits == 4:
             if X is not None and X.shape[1] < w.shape[1]:  # padded FFN columns see zero input
                 X = np.concatenate([X, np.zeros((len(X), w.shape[1] - X.shape[1]))], axis=1)
-            q, m, e = quant_q4(w, g4_d if w.shape[1] == ck.dim else g4_h, X)
+            q, m, e = quant_q4(w, g4_d if w.shape[1] == ck.dim else g4_h, X, S)
             qp, mp, ep = pack_x4n(q, m, e)
         else:
             q, m, e = quant_q8(w, gs_d if w.shape[1] == ck.dim else gs_h)
@@ -405,10 +460,10 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None, bits_att=8, bits_ffn=8
         blob.add(name + "_e", ep)
         q8.append(name)
 
-    def add_mat_parts(name, w, bits, X, part_rows):
+    def add_mat_parts(name, w, bits, X, part_rows, S=None):
         """Quantise the whole matrix (rows are independent), store it as row parts of <= SEG_MAX bytes so
         each part can live in its own allocation."""
-        q, m, e = (quant_q4(w, g4_d, X) if bits == 4 else quant_q8(w, gs_d))
+        q, m, e = (quant_q4(w, g4_d, X, S) if bits == 4 else quant_q8(w, gs_d))
         for p, r0 in enumerate(range(0, w.shape[0], part_rows)):
             r1 = min(r0 + part_rows, w.shape[0])
             qp, mp, ep = (pack_x4n if bits == 4 else pack_x4)(q[r0:r1], m[r0:r1], e[r0:r1])
@@ -433,17 +488,19 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None, bits_att=8, bits_ffn=8
     else:
         Xc = None
     part_rows = max(4, (SEG_MAX // (ck.dim if bits_emb == 8 else ck.dim // 2)) // 4 * 4)
-    emb_parts = add_mat_parts("emb", emb, bits_emb, Xc, part_rows)
+    if ck.qat is not None:
+        assert keep is None and bits_att == bits_ffn == bits_emb == 4, "QAT scales are for the all-int4 student"
+    emb_parts = add_mat_parts("emb", emb, bits_emb, Xc, part_rows, qat_s("emb", emb))
     for l in range(ck.n_layers):
         blob.add(f"l{l}_rms_att", q16(ck.rms_att[l]))
-        add_mat(f"l{l}_wq", ck.wq[l] * qfold, bits_att, cx(l, "att_in"))
-        add_mat(f"l{l}_wk", ck.wk[l], bits_att, cx(l, "att_in"))
-        add_mat(f"l{l}_wv", ck.wv[l], bits_att, cx(l, "att_in"))
-        add_mat(f"l{l}_wo", ck.wo[l], bits_att, cx(l, "wo_in"))
+        add_mat(f"l{l}_wq", ck.wq[l] * qfold, bits_att, cx(l, "att_in"), qat_s(f"l{l}_wq", ck.wq[l], qfold))
+        add_mat(f"l{l}_wk", ck.wk[l], bits_att, cx(l, "att_in"), qat_s(f"l{l}_wk", ck.wk[l]))
+        add_mat(f"l{l}_wv", ck.wv[l], bits_att, cx(l, "att_in"), qat_s(f"l{l}_wv", ck.wv[l]))
+        add_mat(f"l{l}_wo", ck.wo[l], bits_att, cx(l, "wo_in"), qat_s(f"l{l}_wo", ck.wo[l]))
         blob.add(f"l{l}_rms_ffn", q16(ck.rms_ffn[l]))
-        add_mat(f"l{l}_w1", w1[l], bits_ffn, cx(l, "ffn_in"))
-        add_mat(f"l{l}_w2", w2[l], bits_ffn, cx(l, "w2_in"))
-        add_mat(f"l{l}_w3", w3[l], bits_ffn, cx(l, "ffn_in"))
+        add_mat(f"l{l}_w1", w1[l], bits_ffn, cx(l, "ffn_in"), qat_s(f"l{l}_w1", w1[l]))
+        add_mat(f"l{l}_w2", w2[l], bits_ffn, cx(l, "w2_in"), qat_s(f"l{l}_w2", w2[l]))
+        add_mat(f"l{l}_w3", w3[l], bits_ffn, cx(l, "ffn_in"), qat_s(f"l{l}_w3", w3[l]))
     blob.add("rms_final", q16(ck.rms_final))
     if not ck.shared:
         cls = np.zeros((vrows, ck.dim), np.float32)
@@ -451,7 +508,7 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None, bits_att=8, bits_ffn=8
         add_mat_parts("cls", cls, bits_emb, None if calib is None else calib["cls_in"], part_rows)
 
     # RoPE table in Q30 from the float32 angles run.c would use (rounded once, in float64).
-    ang = rope_angles(ck.seq, hd).astype(np.float64)
+    ang = rope_angles(ck.seq, hd, ck.rope_theta).astype(np.float64)
     rope = np.stack([np.round(np.cos(ang) * (1 << 30)), np.round(np.sin(ang) * (1 << 30))], axis=-1)
     blob.add("rope", rope.astype(np.int32))
 
@@ -534,7 +591,11 @@ def main(argv=None):
     ap.add_argument("--seq", type=int, help="compile a shorter context than the checkpoint's (saves KV memory)")
     a = ap.parse_args(argv)
     ck = Ckpt(a.ckpt)
-    tok = Tokenizer(a.tokenizer, ck.vocab)
+    if a.tokenizer.endswith(".json"):  # HF byte-level BPE; the checkpoint's rows are its kept tokens
+        tok = BLModelTok(a.tokenizer, ck.meta["keep"])
+        assert len(tok.new2old) == ck.vocab, (len(tok.new2old), ck.vocab)
+    else:
+        tok = Tokenizer(a.tokenizer, ck.vocab)
     keep = None
     if a.vocab_usage:
         counts = np.load(a.vocab_usage)
@@ -542,6 +603,8 @@ def main(argv=None):
         keep = sorted(set(np.nonzero(counts >= a.min_count)[0].tolist()) | {0, 1, 2} | set(range(3, 259)))
     if a.seq:
         ck.seq = min(ck.seq, a.seq)
+    if ck.qat is not None:  # the group size the scales were learned with
+        a.gs4 = ck.dim // ck.qat["l0_wq"].shape[1]
     calib = None
     if a.calib and 4 in (a.bits_att, a.bits_ffn, a.bits_emb):
         import gptq

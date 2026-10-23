@@ -32,7 +32,25 @@ jobs:
           cd ~/data
           [ -f TinyStories-valid.txt ] || curl -sSfL -o TinyStories-valid.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-valid.txt
       - name: Gate
-        run: tests/run_all.sh
+        run: CHAT=0 tests/run_all.sh
+  chat:
+    # the byte-level / GQA / learned-scale int4 chat path, on an untrained student cut from SmolLM2
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabi libc6-dev-armel-cross qemu-user
+          pip install numpy pyarrow pandas huggingface_hub transformers
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-smollm2-v1
+      - name: Chat gate
+        run: ONLY_CHAT=1 tests/run_all.sh
   perf:
     runs-on: ubuntu-24.04
     needs: gate
