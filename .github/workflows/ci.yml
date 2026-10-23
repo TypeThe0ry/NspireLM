@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabi libc6-dev-armel-cross qemu-user
+          pip install numpy
+      - name: Cache models and data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/models
+            ~/data
+          key: models-v1
+      - name: Fetch models and data
+        run: |
+          mkdir -p ~/models ~/data
+          cd ~/models
+          base=https://huggingface.co/karpathy/tinyllamas/resolve/main
+          [ -f stories260K.bin ] || curl -sSfL -o stories260K.bin $base/stories260K/stories260K.bin
+          [ -f tok512.bin ] || curl -sSfL -o tok512.bin $base/stories260K/tok512.bin
+          [ -f stories15M.bin ] || curl -sSfL -o stories15M.bin $base/stories15M.bin
+          [ -f tokenizer.bin ] || curl -sSfL -o tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
+          cd ~/data
+          [ -f TinyStories-valid.txt ] || curl -sSfL -o TinyStories-valid.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-valid.txt
+      - name: Gate
+        run: tests/run_all.sh
