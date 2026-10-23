@@ -80,9 +80,19 @@ class Tokenizer:
                 score, n = struct.unpack("fi", f.read(8))
                 self.scores.append(score)
                 self.vocab.append(f.read(n))
+        assert self.max_len <= 64, "runtime re-segmentation buffer"
         self.lookup = {}
         for i, s in enumerate(self.vocab):
             self.lookup.setdefault(s, i)
+        self.set_keep(None)
+
+    def set_keep(self, keep):
+        """Restrict the model vocabulary to `keep` (sorted old ids); None = all."""
+        n = len(self.vocab)
+        self.new2old = list(range(n)) if keep is None else list(keep)
+        self.old2new = [-1] * n
+        for new, old in enumerate(self.new2old):
+            self.old2new[old] = new
 
     def encode(self, text, bos=True, eos=False):
         toks = [1] if bos else []
@@ -112,10 +122,30 @@ class Tokenizer:
             toks[best_i:best_i + 2] = [best_id]
         if eos:
             toks.append(2)
-        return toks
+        return self.fixup(toks)
 
-    def piece(self, prev, tok):
-        s = self.vocab[tok]
+    def fixup(self, toks):
+        """Map to model ids; a pruned token is re-segmented by longest match over kept tokens."""
+        out = []
+        for t in toks:
+            if self.old2new[t] >= 0:
+                out.append(self.old2new[t])
+                continue
+            b, i = self.vocab[t], 0
+            while i < len(b):
+                for L in range(min(self.max_len, len(b) - i), 0, -1):
+                    tid = self.lookup.get(b[i:i + L], -1)
+                    if tid >= 0 and self.old2new[tid] >= 0:
+                        out.append(self.old2new[tid])
+                        i += L
+                        break
+                else:
+                    out.append(self.old2new[b[i] + 3])
+                    i += 1
+        return out
+
+    def piece(self, prev, tok):  # model ids
+        s = self.vocab[self.new2old[tok]]
         if prev == 1 and s.startswith(b" "):
             s = s[1:]
         if len(s) == 6 and s.startswith(b"<0x") and s.endswith(b">"):
@@ -130,7 +160,7 @@ class Tokenizer:
             rank[i] = r
         sorted_ids = sorted(range(len(self.vocab)), key=lambda i: (self.vocab[i], i))
         blob = bytearray()
-        blob += struct.pack("<4I", 0x544C534E, len(self.vocab), self.max_len, 0)
+        blob += struct.pack("<4I", 0x544C534E, len(self.vocab), self.max_len, len(self.new2old))
         offs, strs = [], bytearray()
         for s in self.vocab:
             offs.append(len(strs))
@@ -138,6 +168,8 @@ class Tokenizer:
         blob += struct.pack(f"<{len(rank)}i", *rank)
         blob += struct.pack(f"<{len(offs)}I", *offs)
         blob += struct.pack(f"<{len(sorted_ids)}I", *sorted_ids)
+        blob += struct.pack(f"<{len(self.old2new)}i", *self.old2new)
+        blob += struct.pack(f"<{len(self.new2old)}i", *self.new2old)
         blob += struct.pack("<I", len(strs))
         blob += strs
         with open(path, "wb") as f:
@@ -286,9 +318,9 @@ class Blob:
         self.buf += b
 
 
-def compile_model(ck, tok, outdir, gs_want=64):
+def compile_model(ck, tok, outdir, gs_want=64, keep=None):
     os.makedirs(outdir, exist_ok=True)
-    assert ck.dim % 8 == 0 and ck.kv_dim % 4 == 0 and ck.vocab % 4 == 0, "x4 layout needs these"
+    assert ck.dim % 8 == 0 and ck.kv_dim % 4 == 0, "x4 layout needs these"
     # pad the FFN width to a multiple of 16 with zero weights: silu(0) * 0 contributes nothing
     hid = -(-ck.hidden // 16) * 16
     w1 = np.zeros((ck.n_layers, hid, ck.dim), np.float32); w1[:, :ck.hidden] = ck.w1
@@ -314,7 +346,12 @@ def compile_model(ck, tok, outdir, gs_want=64):
     def q16(v):  # norm gains as Q16 int32
         return np.round(v.astype(np.float64) * 65536).astype(np.int32)
 
-    add_mat("emb", ck.tok_emb)
+    tok.set_keep(keep)
+    vocab = len(tok.new2old)
+    vrows = -(-vocab // 4) * 4  # x4 layout: pad with zero rows, never sampled
+    emb = np.zeros((vrows, ck.dim), np.float32)
+    emb[:vocab] = ck.tok_emb[tok.new2old]
+    add_mat("emb", emb)
     for l in range(ck.n_layers):
         blob.add(f"l{l}_rms_att", q16(ck.rms_att[l]))
         add_mat(f"l{l}_wq", ck.wq[l] * qfold)
@@ -327,7 +364,9 @@ def compile_model(ck, tok, outdir, gs_want=64):
         add_mat(f"l{l}_w3", w3[l])
     blob.add("rms_final", q16(ck.rms_final))
     if not ck.shared:
-        add_mat("cls", ck.wcls)
+        cls = np.zeros((vrows, ck.dim), np.float32)
+        cls[:vocab] = ck.wcls[tok.new2old]
+        add_mat("cls", cls)
 
     # RoPE table in Q30 from the float32 angles run.c would use (rounded once, in float64).
     ang = rope_angles(ck.seq, hd).astype(np.float64)
@@ -350,7 +389,7 @@ def compile_model(ck, tok, outdir, gs_want=64):
     w("#ifndef NSLM_MODEL_H\n#define NSLM_MODEL_H\n#include <stdint.h>")
     for k, v in (("DIM", ck.dim), ("HIDDEN", hid), ("LAYERS", ck.n_layers),
                  ("HEADS", ck.n_heads), ("KV_HEADS", ck.n_kv_heads), ("HEAD_DIM", hd),
-                 ("KV_DIM", ck.kv_dim), ("VOCAB", ck.vocab), ("SEQ", ck.seq), ("GS_D", gs_d), ("GS_H", gs_h),
+                 ("KV_DIM", ck.kv_dim), ("VOCAB", vocab), ("VOCAB_ROWS", vrows), ("VOCAB_FULL", ck.vocab), ("SEQ", ck.seq), ("GS_D", gs_d), ("GS_H", gs_h),
                  ("SHARED_CLS", int(ck.shared)), ("BLOB_BYTES", len(blob.buf)),
                  ("MAGIC", MAGIC), ("VERSION", VERSION)):
         w(f"#define NSLM_{k} {v}")
@@ -373,7 +412,7 @@ def compile_model(ck, tok, outdir, gs_want=64):
         for l in range(ck.n_layers):
             for t in ("rms_att", "wq_q", "w2_e", "rms_ffn"):
                 assert base[f"l{l}_{t}"] == base[f"l0_{t}"] + l * stride, (l, t)
-    return {"gs": (gs_d, gs_h), "blob_bytes": len(blob.buf)}
+    return {"gs": (gs_d, gs_h), "blob_bytes": len(blob.buf), "vocab": vocab}
 
 
 def main(argv=None):
@@ -382,12 +421,20 @@ def main(argv=None):
     ap.add_argument("tokenizer")
     ap.add_argument("--out", required=True)
     ap.add_argument("--gs", type=int, default=64)
+    ap.add_argument("--vocab-usage", help="token counts over the training corpus (tools/vocab_usage.py); "
+                    "tokens never seen are compiled out of the embedding and classifier")
+    ap.add_argument("--min-count", type=int, default=1)
     a = ap.parse_args(argv)
     ck = Ckpt(a.ckpt)
     tok = Tokenizer(a.tokenizer, ck.vocab)
-    info = compile_model(ck, tok, a.out, a.gs)
+    keep = None
+    if a.vocab_usage:
+        counts = np.load(a.vocab_usage)
+        assert len(counts) == ck.vocab
+        keep = sorted(set(np.nonzero(counts >= a.min_count)[0].tolist()) | {0, 1, 2} | set(range(3, 259)))
+    info = compile_model(ck, tok, a.out, a.gs, keep)
     print(f"nslmc: dim={ck.dim} hidden={ck.hidden} layers={ck.n_layers} heads={ck.n_heads}/"
-          f"{ck.n_kv_heads} vocab={ck.vocab} seq={ck.seq} gs={info['gs']} "
+          f"{ck.n_kv_heads} vocab={info['vocab']}/{ck.vocab} seq={ck.seq} gs={info['gs']} "
           f"blob={info['blob_bytes'] / 2**20:.2f} MiB -> {a.out}")
 
 

@@ -41,10 +41,17 @@ def main():
     ap.add_argument("--min-top1", type=float, default=0.0)
     ap.add_argument("--max-kl", type=float, default=1e9)
     ap.add_argument("--max-ppl-ratio", type=float, default=1e9)
+    ap.add_argument("--vocab-usage", help="same file the model was compiled with (vocab pruning)")
+    ap.add_argument("--min-count", type=int, default=1)
     a = ap.parse_args()
 
     ck = nslmc.Ckpt(a.ckpt)
     tok = nslmc.Tokenizer(a.tokenizer, ck.vocab)
+    if a.vocab_usage:
+        counts = np.load(a.vocab_usage)
+        tok.set_keep(sorted(set(np.nonzero(counts >= a.min_count)[0].tolist()) | {0, 1, 2} | set(range(3, 259))))
+    keep = np.asarray(tok.new2old)
+    nv = len(keep)
     exe = shlex.split(a.runner) + [a.bin or os.path.join(a.build, "nslm_host"),
                                     os.path.join(a.build, "model.nslm"), os.path.join(a.build, "tok.nslt")]
     with open(a.valid, encoding="utf-8") as f:
@@ -63,24 +70,27 @@ def main():
             tp, lp = os.path.join(td, "t.i32"), os.path.join(td, "l.i32")
             np.asarray(ids, np.int32).tofile(tp)
             subprocess.run(exe + ["--eval", tp, lp], check=True, capture_output=True)
-            li = np.fromfile(lp, np.int32).reshape(len(ids), ck.vocab).astype(np.float64) / 65536.0
+            li = np.fromfile(lp, np.int32).reshape(len(ids), nv).astype(np.float64) / 65536.0
         fm.reset()
-        lf = np.stack([fm.forward(t, p) for p, t in enumerate(ids)]).astype(np.float64)
-        pf, pi = log_softmax(lf), log_softmax(li)
+        lf = np.stack([fm.forward(int(keep[t]), p) for p, t in enumerate(ids)]).astype(np.float64)
+        pf_full = log_softmax(lf)
+        pf, pi = log_softmax(lf[:, keep]), log_softmax(li)  # float renormalised over the model vocab
         n = len(ids) - 1
         tgt = np.asarray(ids[1:])
         tot["n"] += n
-        tot["top1"] += int((lf[:n].argmax(-1) == li[:n].argmax(-1)).sum())
+        tot["top1"] += int((lf[:n].argmax(-1) == keep[li[:n].argmax(-1)]).sum())
         tot["kl"] += float((np.exp(pf[:n]) * (pf[:n] - pi[:n])).sum())
-        tot["nll_f"] += float(-pf[np.arange(n), tgt].sum())
+        tot["nll_f"] += float(-pf_full[np.arange(n), keep[tgt]].sum())
         tot["nll_i"] += float(-pi[np.arange(n), tgt].sum())
+        tot["outside"] = tot.get("outside", 0.0) + float(1 - np.exp(pf_full[:n][:, keep]).sum(-1).sum() / n) * n
         print(f"story {si}: {len(ids)} tokens", file=sys.stderr)
 
     n = tot["n"]
     top1, kl = tot["top1"] / n, tot["kl"] / n
     ppl_f, ppl_i = np.exp(tot["nll_f"] / n), np.exp(tot["nll_i"] / n)
     print(f"positions={n} top1={top1:.4f} kl={kl:.5f} ppl_float={ppl_f:.4f} ppl_int={ppl_i:.4f} "
-          f"ratio={ppl_i / ppl_f:.4f} tokenizer_mismatch={tok_mismatch}")
+          f"ratio={ppl_i / ppl_f:.4f} tokenizer_mismatch={tok_mismatch} vocab={nv} "
+          f"float_mass_outside_vocab={tot.get('outside', 0) / n:.2e}")
     ok = top1 >= a.min_top1 and kl <= a.max_kl and ppl_i / ppl_f <= a.max_ppl_ratio and tok_mismatch == 0
     sys.exit(0 if ok else 1)
 

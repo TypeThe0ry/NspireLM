@@ -8,14 +8,18 @@ int nslm_tok_bind(nslm_tok *t, const void *image, size_t len) {
     if (((uintptr_t)image & 3) || len < 16 || h[0] != 0x544C534Eu) return -1;
     t->n = (int)h[1];
     t->max_len = (int)h[2];
-    size_t need = 16 + (size_t)t->n * 12 + 4;
-    if (len < need) return -1;
-    t->rank = (const int32_t *)(h + 4);
-    t->off = (const uint32_t *)(h + 4 + t->n);
-    t->sorted = (const uint32_t *)(h + 4 + 2 * t->n);
-    uint32_t slen = h[4 + 3 * t->n];
+    t->n_model = (int)h[3];
+    size_t need = 16 + (size_t)t->n * 16 + (size_t)t->n_model * 4 + 4;
+    if (len < need || t->n_model < 259 || t->n_model > t->n) return -1;
+    const uint32_t *p = h + 4;
+    t->rank = (const int32_t *)p;
+    t->off = p + t->n;
+    t->sorted = p + 2 * t->n;
+    t->old2new = (const int32_t *)(p + 3 * t->n);
+    t->new2old = (const int32_t *)(p + 4 * t->n);
+    uint32_t slen = p[4 * t->n + t->n_model];
     if (len < need + slen) return -1;
-    t->str = (const char *)(h + 5 + 3 * t->n);
+    t->str = (const char *)(p + 4 * t->n + t->n_model + 1);
     return 0;
 }
 
@@ -71,11 +75,42 @@ int nslm_tok_encode(const nslm_tok *t, const char *text, int *out, char *buf) {
         memmove(out + best_i + 1, out + best_i + 2, (size_t)(n - best_i - 2) * sizeof *out);
         n--;
     }
+    /* Map to model ids. A compiled-out piece is re-segmented in place by longest match over kept
+     * pieces (bytes are always kept). Every model token covers at least one byte, so n never exceeds
+     * strlen(text) + 2 and the caller's out[] bound holds throughout. */
+    for (int i = 0; i < n; i++) {
+        int id = out[i];
+        if (t->old2new[id] >= 0) {
+            out[i] = t->old2new[id];
+            continue;
+        }
+        int pend[64], np = 0; /* a piece is at most max_len (<= 64 in practice) bytes */
+        const char *src = t->str + t->off[id];
+        int L = (int)strlen(src);
+        for (int k = 0; k < L && np < 64;) {
+            int done = 0;
+            for (int len = (L - k < t->max_len ? L - k : t->max_len); len > 0 && !done; len--) {
+                memcpy(buf, src + k, (size_t)len);
+                buf[len] = 0;
+                int tid = lookup(t, buf);
+                if (tid >= 0 && t->old2new[tid] >= 0) {
+                    pend[np++] = t->old2new[tid];
+                    k += len;
+                    done = 1;
+                }
+            }
+            if (!done) pend[np++] = t->old2new[(unsigned char)src[k++] + 3];
+        }
+        memmove(out + i + np, out + i + 1, (size_t)(n - i - 1) * sizeof *out);
+        memcpy(out + i, pend, (size_t)np * sizeof *out);
+        n += np - 1;
+        i += np - 1;
+    }
     return n;
 }
 
 const char *nslm_tok_piece(const nslm_tok *t, int prev, int tok, int *n, char byte_buf[2]) {
-    const char *s = t->str + t->off[tok];
+    const char *s = t->str + t->off[t->new2old[tok]];
     if (prev == 1 && s[0] == ' ') s++;
     size_t len = strlen(s);
     if (len == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
