@@ -52,7 +52,7 @@
 cpu_mhz=396 battery_ok=1
 hash=xxxxxxxx expect=xxxxxxxx BITEXACT (... ms)
 tok_us_pos8=...  tok_us_last=...
-seq_us=... stride_us=... (4 MB)
+seq_us=... stride_us=... (... KB)
 cycles_per_line seq=... stride=...
 free_largest_kb=... state_kb=...
 ```
@@ -63,7 +63,7 @@ free_largest_kb=... state_kb=...
 | `BITEXACT` | 计算器上的 logits 哈希与电脑上完全相同 | 必须是 `BITEXACT`；出现 `MISMATCH` 就是 bug |
 | `tok_us_pos8` | 位置 8 处生成一个 token 的微秒数 | 周期模型预测 128 ms（7.8 tok/s），可信区间约 128–160 ms |
 | `tok_us_last` | 最后一个位置（255）的耗时 | 预测约 151 ms |
-| `cycles_per_line seq / stride` | 顺序读与跨行读的每缓存行周期数 | 两者相减可以算出行填充中关键字延迟 `lc` 与每字间隔 `beat` 的分配，这是周期模型唯一未定的参数 |
+| `cycles_per_line seq / stride` | 顺序读与跨行读的每缓存行周期数（缓冲区优先 4 MB，内存不够时自动减半，括号里是实际大小） | 两者相减可以算出行填充中关键字延迟 `lc` 与每字间隔 `beat` 的分配，这是周期模型唯一未定的参数 |
 | `free_largest_kb` | 模型加载后，最大还能 malloc 多少 | 用来决定能否换更大的模型（stories42M） |
 
 ## 如果出问题
@@ -75,3 +75,21 @@ free_largest_kb=... state_kb=...
 | 提示 "Not enough memory" | 先复位计算器再试 |
 | 屏幕卡住不动 | 拍照记录卡在哪一步（加载进度多少），然后复位 |
 | `MISMATCH` | 请把整份报告发给我：这说明计算器上的计算与电脑结果不一致，需要修 |
+
+## 真机结果
+
+### 2026-10-23，CX II CAS，电池供电，CI 构建 `bb52316`
+
+```
+cpu_mhz=396 battery_ok=1
+hash=bac1935d expect=bac1935d BITEXACT (2472 ms)
+tok_us_pos8=160882 tok_us_last=178261
+membench: alloc failed
+free_largest_kb=2944 state_kb=1002
+model=288 params_q8_kb=9890
+```
+
+- **逐比特一致**：计算器上的 logits 哈希与电脑相同，Ndless gcc 构建没有引入数值差异。
+- **速度**：位置 8 处 160.9 ms/token（6.2 tok/s），比周期模型预测的 128 ms 慢 26%，落在可信区间上沿；位置 255 处 178 ms，比预测的 151 ms 慢 18%。
+- **内存**：模型加载后最大只能再分配约 2.9 MB，所以 4 MB 的缓存行测试没跑成（之后的版本会自动缩小缓冲区）。剩余内存也说明，stories42M 按现在的加载方式放不下。
+- 通过 USB 上传 `model.nslm.tns` 时出过一次损坏（第一个 1439 字节的数据包被写了两次），读回比对才发现。上传后一定要读回比对，覆盖已有文件也不可靠，最好传到新文件夹。
