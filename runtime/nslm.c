@@ -113,14 +113,16 @@ static inline int32_t silu_mul(int32_t x, int32_t h3) {
     return sat32(rshr(silu * h3, 16));
 }
 
-/* q8 row-slice lookup: embedding row -> fx32. */
+/* q8 row lookup from the x4 layout: embedding row -> fx32 (same scale math as the kernel). */
 static void embed(int32_t *x, const nslm_q8 *w, int tok) {
-    const int8_t *q = w->q + (size_t)tok * NSLM_DIM;
-    const uint16_t *m = w->m + (size_t)tok * (NSLM_DIM / NSLM_GS_D);
-    int sh = w->e[tok] - 16;
-    for (int g = 0; g < NSLM_DIM / NSLM_GS_D; g++)
-        for (int i = 0; i < NSLM_GS_D; i++)
-            x[g * NSLM_GS_D + i] = sat32(rshr((int32_t)q[g * NSLM_GS_D + i] * (int32_t)m[g], sh));
+    const int nc = NSLM_DIM / 8, ng = NSLM_DIM / NSLM_GS_D;
+    const uint8_t *blk = w->q + (size_t)(tok >> 2) * 32 * nc;
+    const uint16_t *mb = w->m + (size_t)(tok >> 2) * 4 * ng;
+    int j = tok & 3, sh = w->e[tok] - 16;
+    for (int i = 0; i < NSLM_DIM; i++) {
+        int32_t q = (int32_t)blk[(i >> 3) * 32 + j * 8 + (i & 7)] - 128;
+        x[i] = sat32(rshr(q * (int32_t)mb[(i / NSLM_GS_D) * 4 + j], sh));
+    }
 }
 
 static void rope(int32_t *v, int nh, const int32_t *tab) {
@@ -159,7 +161,7 @@ static int32_t quant_kv(int8_t *dst, const int32_t *src) {
 static const void *at(const uint8_t *base, uint32_t off) { return base + NSLM_HDR_BYTES + off; }
 
 static nslm_q8 q8_at(const uint8_t *b, uint32_t oq, uint32_t om, uint32_t oe) {
-    nslm_q8 w = {(const int8_t *)at(b, oq), (const uint16_t *)at(b, om), (const int8_t *)at(b, oe)};
+    nslm_q8 w = {(const uint8_t *)at(b, oq), (const uint16_t *)at(b, om), (const int8_t *)at(b, oe)};
     return w;
 }
 
@@ -172,7 +174,7 @@ static nslm_q8 q8_at(const uint8_t *b, uint32_t oq, uint32_t om, uint32_t oe) {
 int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state) {
     const uint8_t *b = (const uint8_t *)image;
     const uint32_t *h = (const uint32_t *)image;
-    if (((uintptr_t)image & 3) || len < NSLM_HDR_BYTES + NSLM_BLOB_BYTES) return -1;
+    if (((uintptr_t)image & 31) || len < NSLM_HDR_BYTES + NSLM_BLOB_BYTES) return -1; /* line aligned */
     if (h[0] != NSLM_MAGIC || h[1] != NSLM_VERSION || h[2] != NSLM_BLOB_BYTES) return -2;
     m->emb = Q8(b, emb);
 #if NSLM_SHARED_CLS
@@ -200,6 +202,15 @@ int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state) {
 }
 
 /* ------------------------------------------------------------------ forward */
+
+static void matmul(nslm_state *s, int32_t *out, const nslm_q8 *w, int ea, int rows, int cols, int gs) {
+    for (int g = 0; g < cols / gs; g++) {
+        int32_t t = 0;
+        for (int i = g * gs; i < (g + 1) * gs; i++) t += s->a[i];
+        s->asum[g] = t;
+    }
+    nslm_matmul_q8(out, w, s->a, s->asum, ea, rows, cols, gs);
+}
 
 static void attention(nslm_state *s, int l, int pos) {
     const int kvmul = NSLM_HEADS / NSLM_KV_HEADS;
@@ -252,9 +263,9 @@ void nslm_forward(nslm_model *m, int token, int pos) {
     for (int l = 0; l < NSLM_LAYERS; l++) {
         const nslm_layer *L = &m->layer[l];
         int ea = rmsnorm_act(s->a, s->x, L->rms_att, NSLM_DIM, tmp);
-        nslm_matmul_q8(s->q, &L->wq, s->a, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
-        nslm_matmul_q8(s->k, &L->wk, s->a, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
-        nslm_matmul_q8(s->v, &L->wv, s->a, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->q, &L->wq, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->k, &L->wk, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->v, &L->wv, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
         rope(s->q, NSLM_HEADS, rope_tab);
         rope(s->k, NSLM_KV_HEADS, rope_tab);
         for (int h = 0; h < NSLM_KV_HEADS; h++) {
@@ -263,19 +274,19 @@ void nslm_forward(nslm_model *m, int token, int pos) {
         }
         attention(s, l, pos);
         ea = quant_act(s->a, s->xb, NSLM_DIM);
-        nslm_matmul_q8(s->xb, &L->wo, s->a, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->xb, &L->wo, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
         for (int i = 0; i < NSLM_DIM; i++) s->x[i] = sat32((int64_t)s->x[i] + s->xb[i]);
 
         ea = rmsnorm_act(s->a, s->x, L->rms_ffn, NSLM_DIM, tmp);
-        nslm_matmul_q8(s->h1, &L->w1, s->a, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
-        nslm_matmul_q8(s->h3, &L->w3, s->a, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->h1, &L->w1, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->h3, &L->w3, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
         for (int i = 0; i < NSLM_HIDDEN; i++) s->h1[i] = silu_mul(s->h1[i], s->h3[i]);
         ea = quant_act(s->a, s->h1, NSLM_HIDDEN);
-        nslm_matmul_q8(s->xb, &L->w2, s->a, ea, NSLM_DIM, NSLM_HIDDEN, NSLM_GS_H);
+        matmul(s, s->xb, &L->w2, ea, NSLM_DIM, NSLM_HIDDEN, NSLM_GS_H);
         for (int i = 0; i < NSLM_DIM; i++) s->x[i] = sat32((int64_t)s->x[i] + s->xb[i]);
     }
     int ea = rmsnorm_act(s->a, s->x, m->rms_final, NSLM_DIM, tmp);
-    nslm_matmul_q8(s->logits, &m->cls, s->a, ea, NSLM_VOCAB, NSLM_DIM, NSLM_GS_D);
+    matmul(s, s->logits, &m->cls, ea, NSLM_VOCAB, NSLM_DIM, NSLM_GS_D);
 }
 
 /* ------------------------------------------------------------------ sampling */

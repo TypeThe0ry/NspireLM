@@ -28,7 +28,9 @@ PY
   "$b/nslm_host" "$b/model.nslm" "$b/tok.nslt" --eval "$b/bitexact.i32" "$b/host.i32" 2>/dev/null
   $QEMU "$b/nslm_arm" "$b/model.nslm" "$b/tok.nslt" --eval "$b/bitexact.i32" "$b/arm.i32" 2>/dev/null
   cmp "$b/host.i32" "$b/arm.i32"
-  echo "$name: host == armv5 (bit-exact)"
+  $QEMU "$b/nslm_armc" "$b/model.nslm" "$b/tok.nslt" --eval "$b/bitexact.i32" "$b/armc.i32" 2>/dev/null
+  cmp "$b/host.i32" "$b/armc.i32"
+  echo "$name: host == armv5 asm == armv5 C (bit-exact)"
 }
 
 run_model stories260K tok512 8

@@ -2,6 +2,7 @@
  *
  *   nslm_host MODEL.nslm TOK.nslt [-p prompt] [-n steps] [-t temp_q8] [-s seed]
  *   nslm_host MODEL.nslm TOK.nslt --encode TEXT      prints token ids
+ *   nslm_host MODEL.nslm TOK.nslt --bench POS        forward at pos 8 and POS between perf marks
  *   nslm_host MODEL.nslm TOK.nslt --eval TOKENS.i32 LOGITS.i32
  *       runs every token of TOKENS (int32) and writes Q16 logits per position
  */
@@ -21,13 +22,22 @@ static void *slurp(const char *path, size_t *len) {
     fseek(f, 0, SEEK_END);
     *len = (size_t)ftell(f);
     fseek(f, 0, SEEK_SET);
-    void *p = malloc(*len + 16);
+    /* 32-byte aligned: each x4 weight chunk must sit in exactly one cache line. The model image has a
+     * 32-byte header, so tensor offsets (multiples of 32) stay line aligned. */
+    void *p = 0;
+    if (posix_memalign(&p, 32, *len + 32)) p = 0;
     if (!p || fread(p, 1, *len, f) != *len) {
         fprintf(stderr, "read failed: %s\n", path);
         exit(1);
     }
     fclose(f);
     return p;
+}
+
+/* The cycle model (perf/arm926.c) prints counters each time this function's block executes. */
+__attribute__((noinline)) void nslm_perf_mark(int id) {
+    __asm__ volatile("" ::: "memory");
+    (void)id;
 }
 
 static double now(void) {
@@ -61,6 +71,18 @@ int main(int argc, char **argv) {
             char *scratch = malloc((size_t)tok.max_len * 2 + 8);
             int n = nslm_tok_encode(&tok, text, ids, scratch);
             for (int k = 0; k < n; k++) printf("%d%c", ids[k], k + 1 < n ? ' ' : '\n');
+            return 0;
+        }
+        if (!strcmp(argv[i], "--bench") && i + 1 < argc) {
+            /* timing only: cost depends on shape and position, not on cache contents */
+            int far = atoi(argv[i + 1]);
+            if (far >= NSLM_SEQ) far = NSLM_SEQ - 1;
+            nslm_forward(&model, 1, 7);
+            nslm_perf_mark(0);
+            nslm_forward(&model, 300 % NSLM_VOCAB, 8);
+            nslm_perf_mark(1);
+            nslm_forward(&model, 301 % NSLM_VOCAB, far);
+            nslm_perf_mark(2);
             return 0;
         }
         if (!strcmp(argv[i], "--eval") && i + 2 < argc) {

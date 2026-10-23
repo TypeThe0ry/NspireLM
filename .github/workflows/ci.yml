@@ -33,3 +33,40 @@ jobs:
           [ -f TinyStories-valid.txt ] || curl -sSfL -o TinyStories-valid.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-valid.txt
       - name: Gate
         run: tests/run_all.sh
+  perf:
+    runs-on: ubuntu-24.04
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabi libc6-dev-armel-cross \
+            ninja-build libglib2.0-dev pkg-config flex bison bc python3-venv
+          pip install numpy
+      - name: Cache qemu with plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/nslm-perf
+          key: qemu-plugins-9.2.4-v1
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ~/models
+          key: models-v1
+      - name: Build cycle model
+        run: perf/build_qemu.sh
+      - name: Calibration check (model vs ChatTLM device logs)
+        run: |
+          export QEMU_PLUGIN_QEMU=~/.cache/nslm-perf/qemu-arm ARM926_SO=~/.cache/nslm-perf/arm926.so
+          perf/calibrate.sh
+      - name: Speed gate (predicted 396 MHz tok/s)
+        run: |
+          export QEMU_PLUGIN_QEMU=~/.cache/nslm-perf/qemu-arm ARM926_SO=~/.cache/nslm-perf/arm926.so
+          mkdir -p ~/models && cd ~/models
+          [ -f stories15M.bin ] || curl -sSfL -o stories15M.bin https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin
+          [ -f tokenizer.bin ] || curl -sSfL -o tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
+          cd $GITHUB_WORKSPACE
+          python3 compiler/nslmc.py ~/models/stories15M.bin ~/models/tokenizer.bin --out build/stories15M
+          make MODEL=build/stories15M arm
+          perf/check_speed.sh build/stories15M 4.8
