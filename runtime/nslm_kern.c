@@ -40,3 +40,39 @@ void nslm_matmul_q8(int32_t *out, const nslm_q8 *w, const int16_t *a, const int3
     }
 }
 #endif
+
+static inline int32_t sat32k(int64_t v) { return v > INT32_MAX ? INT32_MAX : v < INT32_MIN ? INT32_MIN : (int32_t)v; }
+
+#ifdef NSLM_HAVE_ASM_MATMUL
+void nslm_q4_dot_x4(int32_t *acc, const uint8_t *q, const uint16_t *m, const int16_t *a, const int32_t *asum,
+                    int row_blocks, int groups, int lines_per_group);
+
+void nslm_matmul_q4(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
+                    int rows, int cols, int gs) {
+    nslm_q4_dot_x4(out, w->q, w->m, a, asum, rows / 4, cols / gs, gs / 16);
+    for (int r = 0; r < rows; r++) out[r] = sat32k(rshr64(out[r], w->e[r] + ea - 32));
+}
+#else
+void nslm_matmul_q4(int32_t *out, const nslm_q8 *w, const int16_t *a, const int32_t *asum, int ea,
+                    int rows, int cols, int gs) {
+    const int ng = cols / gs, nc = cols / 16;
+    for (int rb = 0; rb < rows / 4; rb++) {
+        const uint32_t *blk = (const uint32_t *)(const void *)(w->q + (size_t)rb * 32 * nc);
+        const uint16_t *mb = w->m + (size_t)rb * 4 * ng;
+        for (int j = 0; j < 4; j++) {
+            int64_t acc = 0;
+            for (int g = 0; g < ng; g++) {
+                int32_t d = 0;
+                for (int i = g * gs; i < (g + 1) * gs; i++) {
+                    uint32_t word = blk[(i >> 4) * 8 + ((i >> 3) & 1) * 4 + j];
+                    d += (int32_t)((word >> (4 * (i & 7))) & 15) * a[i];
+                }
+                d -= asum[g] * 8;
+                acc += ((int64_t)d * mb[g * 4 + j]) >> 16;
+            }
+            int r = rb * 4 + j;
+            out[r] = sat32k(rshr64(acc, w->e[r] + ea - 32));
+        }
+    }
+}
+#endif

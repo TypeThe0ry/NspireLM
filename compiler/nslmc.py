@@ -25,6 +25,7 @@ import numpy as np
 MAGIC = 0x4D4C534E  # "NSLM"
 VERSION = 1
 ALIGN = 32  # cache line: one x4 weight chunk must be one line
+SEG_MAX = 1 << 20  # largest separately allocated piece of the model (the Ndless heap fragments)
 
 # --------------------------------------------------------------------------- checkpoint
 
@@ -277,6 +278,53 @@ def quant_q8(w, gs):
     return q.astype(np.int8).reshape(r, c), m.astype(np.uint16), e.astype(np.int8)
 
 
+def scales_to_me(S, Q):
+    """Real group scales S [r, ng] -> uint16 mantissas (<= 32767) and per-row exponents, lowering
+    precision where needed so the kernel's int32 accumulator provably cannot overflow (see quant_q8)."""
+    r, ng = S.shape
+    gs = Q.shape[1] // ng
+    S = np.where(S <= 0, 1e-12, S)
+    e = np.clip(np.floor(np.log2(32767.0 / S.max(axis=1))).astype(np.int64), -60, 90)
+    absq = np.abs(Q.reshape(r, ng, gs)).sum(axis=2).astype(np.float64)
+    while True:
+        m = np.clip(np.round(S * np.exp2(e)[:, None]), 1, 32767)
+        bad = (absq * 32768.0 * m / 65536.0).sum(axis=1) >= 2.0 ** 30
+        if not bad.any():
+            return m.astype(np.uint16), e.astype(np.int8)
+        e = np.where(bad, e - 1, e)
+
+
+def quant_q4(w, gs, X=None):
+    """Group-wise int4 (codes -8..7). With calibration inputs X, GPTQ rounding; otherwise
+    round-to-nearest with a per-group MSE clipping search."""
+    import gptq
+    if X is not None:
+        Q, S = gptq.gptq_quant(w, X, 4, gs)
+    else:
+        r, c = w.shape
+        wg = w.astype(np.float64).reshape(r, c // gs, gs)
+        S = np.stack([gptq._group_scale(wg[:, g, :], 7, -8, (1.0, 0.95, 0.9, 0.85, 0.8, 0.75))
+                      for g in range(c // gs)], axis=1)
+        Q = np.clip(np.round(wg / S[:, :, None]), -8, 7).reshape(r, c).astype(np.int64)
+    m, e = scales_to_me(S, Q)
+    return Q.astype(np.int8), m, e
+
+
+def pack_x4n(q, m, e):
+    """Kernel layout "x4n" (int4): blocks of 4 rows; each 32-byte line holds 16 columns of the 4 rows.
+    Words 0-3 are columns 0-7 of rows 0-3, words 4-7 columns 8-15; column j of a word is bits 4j..4j+3,
+    stored offset-binary (q + 8)."""
+    r, c = q.shape
+    assert r % 4 == 0 and c % 16 == 0, (r, c)
+    u = (q.astype(np.int16) + 8).astype(np.uint32)
+    u = u.reshape(r // 4, 4, c // 16, 2, 8)              # rb, j, chunk, half, k
+    words = (u << (4 * np.arange(8, dtype=np.uint32))).sum(axis=-1).astype(np.uint32)
+    words = words.transpose(0, 2, 3, 1).copy()            # rb, chunk, half, j
+    ng = m.shape[1]
+    mp = m.reshape(r // 4, 4, ng).transpose(0, 2, 1).copy()
+    return words, mp, e
+
+
 def dequant_q8(q, m, e, gs):
     r, c = q.shape
     s = m.astype(np.float64) / np.exp2(e.astype(np.float64))[:, None]
@@ -294,6 +342,13 @@ def pack_x4(q, m, e):
     ng = m.shape[1]
     mp = m.reshape(r // 4, 4, ng).transpose(0, 2, 1).copy()
     return qp, mp, e
+
+
+def pick_gs16(cols, want):
+    """int4 groups: a multiple of 16 (one x4n line) dividing cols, at most `want`."""
+    g = [x for x in range(16, want + 1, 16) if cols % x == 0]
+    assert g, f"no int4 group size for {cols} columns"
+    return max(g)
 
 
 def pick_gs(cols, want):
@@ -318,7 +373,7 @@ class Blob:
         self.buf += b
 
 
-def compile_model(ck, tok, outdir, gs_want=64, keep=None):
+def compile_model(ck, tok, outdir, gs_want=64, keep=None, bits_att=8, bits_ffn=8, gs4=32, calib=None, bits_emb=8):
     os.makedirs(outdir, exist_ok=True)
     assert ck.dim % 8 == 0 and ck.kv_dim % 4 == 0, "x4 layout needs these"
     # pad the FFN width to a multiple of 16 with zero weights: silu(0) * 0 contributes nothing
@@ -333,15 +388,37 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None):
 
     blob = Blob()
     q8 = []
+    g4_d, g4_h = pick_gs16(ck.dim, gs4), pick_gs16(hid, gs4)
 
-    def add_mat(name, w):
-        q, m, e = quant_q8(w, gs_d if w.shape[1] == ck.dim else gs_h)
+    def add_mat(name, w, bits=8, X=None):
         assert (w.shape[1] == ck.dim) or (w.shape[1] == hid)
-        qp, mp, ep = pack_x4(q, m, e)
+        if bits == 4:
+            if X is not None and X.shape[1] < w.shape[1]:  # padded FFN columns see zero input
+                X = np.concatenate([X, np.zeros((len(X), w.shape[1] - X.shape[1]))], axis=1)
+            q, m, e = quant_q4(w, g4_d if w.shape[1] == ck.dim else g4_h, X)
+            qp, mp, ep = pack_x4n(q, m, e)
+        else:
+            q, m, e = quant_q8(w, gs_d if w.shape[1] == ck.dim else gs_h)
+            qp, mp, ep = pack_x4(q, m, e)
         blob.add(name + "_q", qp)
         blob.add(name + "_m", mp)
         blob.add(name + "_e", ep)
         q8.append(name)
+
+    def add_mat_parts(name, w, bits, X, part_rows):
+        """Quantise the whole matrix (rows are independent), store it as row parts of <= SEG_MAX bytes so
+        each part can live in its own allocation."""
+        q, m, e = (quant_q4(w, g4_d, X) if bits == 4 else quant_q8(w, gs_d))
+        for p, r0 in enumerate(range(0, w.shape[0], part_rows)):
+            r1 = min(r0 + part_rows, w.shape[0])
+            qp, mp, ep = (pack_x4n if bits == 4 else pack_x4)(q[r0:r1], m[r0:r1], e[r0:r1])
+            blob.add(f"{name}_p{p}_q", qp)
+            blob.add(f"{name}_p{p}_m", mp)
+            blob.add(f"{name}_p{p}_e", ep)
+        return -(-w.shape[0] // part_rows)
+
+    def cx(l, key):  # calibration inputs for GPTQ, if any
+        return None if calib is None else calib[f"l{l}_{key}"]
 
     def q16(v):  # norm gains as Q16 int32
         return np.round(v.astype(np.float64) * 65536).astype(np.int32)
@@ -351,22 +428,27 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None):
     vrows = -(-vocab // 4) * 4  # x4 layout: pad with zero rows, never sampled
     emb = np.zeros((vrows, ck.dim), np.float32)
     emb[:vocab] = ck.tok_emb[tok.new2old]
-    add_mat("emb", emb)
+    if bits_emb == 4 and calib is not None and ck.shared:  # the tied matrix is calibrated as the classifier
+        Xc = calib["cls_in"]
+    else:
+        Xc = None
+    part_rows = max(4, (SEG_MAX // (ck.dim if bits_emb == 8 else ck.dim // 2)) // 4 * 4)
+    emb_parts = add_mat_parts("emb", emb, bits_emb, Xc, part_rows)
     for l in range(ck.n_layers):
         blob.add(f"l{l}_rms_att", q16(ck.rms_att[l]))
-        add_mat(f"l{l}_wq", ck.wq[l] * qfold)
-        add_mat(f"l{l}_wk", ck.wk[l])
-        add_mat(f"l{l}_wv", ck.wv[l])
-        add_mat(f"l{l}_wo", ck.wo[l])
+        add_mat(f"l{l}_wq", ck.wq[l] * qfold, bits_att, cx(l, "att_in"))
+        add_mat(f"l{l}_wk", ck.wk[l], bits_att, cx(l, "att_in"))
+        add_mat(f"l{l}_wv", ck.wv[l], bits_att, cx(l, "att_in"))
+        add_mat(f"l{l}_wo", ck.wo[l], bits_att, cx(l, "wo_in"))
         blob.add(f"l{l}_rms_ffn", q16(ck.rms_ffn[l]))
-        add_mat(f"l{l}_w1", w1[l])
-        add_mat(f"l{l}_w2", w2[l])
-        add_mat(f"l{l}_w3", w3[l])
+        add_mat(f"l{l}_w1", w1[l], bits_ffn, cx(l, "ffn_in"))
+        add_mat(f"l{l}_w2", w2[l], bits_ffn, cx(l, "w2_in"))
+        add_mat(f"l{l}_w3", w3[l], bits_ffn, cx(l, "ffn_in"))
     blob.add("rms_final", q16(ck.rms_final))
     if not ck.shared:
         cls = np.zeros((vrows, ck.dim), np.float32)
         cls[:vocab] = ck.wcls[tok.new2old]
-        add_mat("cls", cls)
+        add_mat_parts("cls", cls, bits_emb, None if calib is None else calib["cls_in"], part_rows)
 
     # RoPE table in Q30 from the float32 angles run.c would use (rounded once, in float64).
     ang = rope_angles(ck.seq, hd).astype(np.float64)
@@ -390,10 +472,29 @@ def compile_model(ck, tok, outdir, gs_want=64, keep=None):
     for k, v in (("DIM", ck.dim), ("HIDDEN", hid), ("LAYERS", ck.n_layers),
                  ("HEADS", ck.n_heads), ("KV_HEADS", ck.n_kv_heads), ("HEAD_DIM", hd),
                  ("KV_DIM", ck.kv_dim), ("VOCAB", vocab), ("VOCAB_ROWS", vrows), ("VOCAB_FULL", ck.vocab), ("SEQ", ck.seq), ("GS_D", gs_d), ("GS_H", gs_h),
+                 ("BITS_ATT", bits_att), ("BITS_FFN", bits_ffn), ("BITS_EMB", bits_emb),
+                 ("GS_EMB", g4_d if bits_emb == 4 else gs_d),
+                 ("GS_ATT", g4_d if bits_att == 4 else gs_d), ("GS_FFN_D", g4_d if bits_ffn == 4 else gs_d),
+                 ("GS_FFN_H", g4_h if bits_ffn == 4 else gs_h),
                  ("SHARED_CLS", int(ck.shared)), ("BLOB_BYTES", len(blob.buf)),
                  ("MAGIC", MAGIC), ("VERSION", VERSION)):
         w(f"#define NSLM_{k} {v}")
     w("#define NSLM_HDR_BYTES 32")
+    w(f"#define NSLM_EMB_PARTS {emb_parts}")
+    w(f"#define NSLM_EMB_PART_ROWS {part_rows}")
+    w("#define NSLM_FOR_EMB_PARTS(X) " + " ".join(f"X({p})" for p in range(emb_parts)))
+    # segment table: file offsets where each separately allocated piece starts (tensor boundaries)
+    segs, cur, size = [0], 0, ALIGN
+    for name, off, n in blob.tensors:
+        fo = off + 32
+        if fo - cur + n > SEG_MAX and fo > cur:
+            segs.append(fo)
+            cur = fo
+    total = 32 + len(blob.buf)
+    w(f"#define NSLM_NSEG {len(segs)}")
+    w("static const uint32_t nslm_seg_off[NSLM_NSEG + 1] = {" + ",".join(f"{x}u" for x in segs + [total]) + "};")
+    biggest = max(b - a for a, b in zip(segs, segs[1:] + [total]))
+    w(f"#define NSLM_SEG_MAX_BYTES {biggest}u")
     for name, off, n in blob.tensors:
         w(f"#define NSLM_OFF_{name} {off}u")
     w("#define NSLM_OFF_L_STRIDE (NSLM_OFF_l1_rms_att - NSLM_OFF_l0_rms_att)" if ck.n_layers > 1
@@ -424,6 +525,13 @@ def main(argv=None):
     ap.add_argument("--vocab-usage", help="token counts over the training corpus (tools/vocab_usage.py); "
                     "tokens never seen are compiled out of the embedding and classifier")
     ap.add_argument("--min-count", type=int, default=1)
+    ap.add_argument("--bits-att", type=int, choices=(4, 8), default=8)
+    ap.add_argument("--bits-ffn", type=int, choices=(4, 8), default=8)
+    ap.add_argument("--bits-emb", type=int, choices=(4, 8), default=8, help="embedding / classifier")
+    ap.add_argument("--gs4", type=int, default=32, help="int4 group size (multiple of 16)")
+    ap.add_argument("--calib", help="text file for GPTQ calibration of int4 matrices")
+    ap.add_argument("--calib-stories", type=int, default=16)
+    ap.add_argument("--seq", type=int, help="compile a shorter context than the checkpoint's (saves KV memory)")
     a = ap.parse_args(argv)
     ck = Ckpt(a.ckpt)
     tok = Tokenizer(a.tokenizer, ck.vocab)
@@ -432,7 +540,15 @@ def main(argv=None):
         counts = np.load(a.vocab_usage)
         assert len(counts) == ck.vocab
         keep = sorted(set(np.nonzero(counts >= a.min_count)[0].tolist()) | {0, 1, 2} | set(range(3, 259)))
-    info = compile_model(ck, tok, a.out, a.gs, keep)
+    if a.seq:
+        ck.seq = min(ck.seq, a.seq)
+    calib = None
+    if a.calib and 4 in (a.bits_att, a.bits_ffn, a.bits_emb):
+        import gptq
+        sts = [x.strip() for x in open(a.calib, encoding="utf-8").read().split("<|endoftext|>") if x.strip()]
+        full = Tokenizer(a.tokenizer, ck.vocab)  # calibration runs the float model on full-vocab ids
+        calib = gptq.calibrate(ck, [full.encode(x) for x in sts[: a.calib_stories]])
+    info = compile_model(ck, tok, a.out, a.gs, keep, a.bits_att, a.bits_ffn, a.gs4, calib, a.bits_emb)
     print(f"nslmc: dim={ck.dim} hidden={ck.hidden} layers={ck.n_layers} heads={ck.n_heads}/"
           f"{ck.n_kv_heads} vocab={info['vocab']}/{ck.vocab} seq={ck.seq} gs={info['gs']} "
           f"blob={info['blob_bytes'] / 2**20:.2f} MiB -> {a.out}")

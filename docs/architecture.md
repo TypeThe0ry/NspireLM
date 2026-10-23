@@ -23,6 +23,9 @@ tokenizer.bin  ─┼─► nslmc (AOT) ──┼─ nslm_model.h  shapes, offse
 | Tokenizer | Float merge scores are replaced by integer ranks, and a pre-sorted index enables binary search | float compares, `qsort` at startup |
 | Vocabulary | `--vocab-usage`: tokens that never occur in the training corpus are compiled out of the embedding and classifier. stories15M goes from 32000 to 12750 tokens. The encoder still uses the full BPE and re-segments any compiled-out piece into kept pieces | 60% of classifier MACs, 5.5 MB |
 
+| Mixed precision | `--bits-att/--bits-ffn/--bits-emb 4\|8`. int4 uses the x4n layout (4 rows × 16 columns per cache line). Rounding is GPTQ with `--calib` text, otherwise round-to-nearest with an MSE clipping search | memory, DRAM traffic |
+| Segments | The image is split at tensor boundaries into ≤ 1 MiB pieces (`nslm_seg_off[]`), and the embedding/classifier into row parts. Each piece is allocated separately: the Ndless heap gives ~21.5 MiB in one block but ~27 MiB in pieces | the single-block ceiling |
+
 ## Number formats (runtime)
 
 | Name | Representation | Used for |
@@ -30,6 +33,7 @@ tokenizer.bin  ─┼─► nslmc (AOT) ──┼─ nslm_model.h  shapes, offse
 | fx32 | int32, Q16 | residual stream, matmul outputs, logits |
 | act16 | int16 plus one power-of-two exponent per vector | matmul inputs (RMSNorm output, attention output, SwiGLU output) |
 | q8 | int8 weights, uint16 group mantissa, int8 row exponent | all matrices including the (tied) classifier |
+| q4 | int4 codes (offset 8), same scale format, x4n layout | selected matrices (`--bits-*`) |
 | kv8 | int8 per (position, kv-head), with a Q24 scale (max\|·\|/127) | KV cache: 4× smaller than fp32 |
 
 The int16 activations carry 15 bits of precision, which is more than the int8 activations of llama2.c's `runq` or
@@ -55,3 +59,16 @@ Current results (2026-10-23):
 
 Greedy generations of both models match llama2.c `run.c` (float32) token for token over the first 64 tokens of
 "Once upon a time".
+
+## The calculator app (`app/`)
+
+`app.c` is platform independent: a prompt editor, streamed generation, and an on-device self-test.
+`plat_nspire.c` is the Ndless layer: LCD blit, key scanning, the SP804 timer, PMU clock decode, and
+`fopen` with 64 KB reads. `plat_host.c` runs the same app headless, with scripted keys, and saves frames
+as images.
+
+The self-test hashes the logits of a fixed prompt and compares them with a hash produced at build time by
+the host build. The gate runs the app on the host and on ARMv5 under qemu, and both must report
+`BITEXACT`. On the calculator, the same report also includes the CPU clock, ms/token, the free heap, and a
+sequential-vs-stride memory benchmark. That benchmark measures the one open parameter of the cycle model
+(`docs/perf-model.md`).

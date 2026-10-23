@@ -113,16 +113,25 @@ static inline int32_t silu_mul(int32_t x, int32_t h3) {
     return sat32(rshr(silu * h3, 16));
 }
 
-/* q8 row lookup from the x4 layout: embedding row -> fx32 (same scale math as the kernel). */
+/* Embedding row lookup -> fx32, same scale math as the matmul kernels (x4 int8 or x4n int4). */
 static void embed(int32_t *x, const nslm_q8 *w, int tok) {
-    const int nc = NSLM_DIM / 8, ng = NSLM_DIM / NSLM_GS_D;
-    const uint8_t *blk = w->q + (size_t)(tok >> 2) * 32 * nc;
+    const int ng = NSLM_DIM / NSLM_GS_EMB;
     const uint16_t *mb = w->m + (size_t)(tok >> 2) * 4 * ng;
     int j = tok & 3, sh = w->e[tok] - 16;
+#if NSLM_BITS_EMB == 4
+    const uint32_t *blk = (const uint32_t *)(const void *)(w->q + (size_t)(tok >> 2) * 32 * (NSLM_DIM / 16));
+    for (int i = 0; i < NSLM_DIM; i++) {
+        uint32_t word = blk[(i >> 4) * 8 + ((i >> 3) & 1) * 4 + j];
+        int32_t q = (int32_t)((word >> (4 * (i & 7))) & 15) - 8;
+        x[i] = sat32(rshr(q * (int32_t)mb[(i / NSLM_GS_EMB) * 4 + j], sh));
+    }
+#else
+    const uint8_t *blk = w->q + (size_t)(tok >> 2) * 32 * (NSLM_DIM / 8);
     for (int i = 0; i < NSLM_DIM; i++) {
         int32_t q = (int32_t)blk[(i >> 3) * 32 + j * 8 + (i & 7)] - 128;
-        x[i] = sat32(rshr(q * (int32_t)mb[(i / NSLM_GS_D) * 4 + j], sh));
+        x[i] = sat32(rshr(q * (int32_t)mb[(i / NSLM_GS_EMB) * 4 + j], sh));
     }
+#endif
 }
 
 static void rope(int32_t *v, int nh, const int32_t *tab) {
@@ -158,58 +167,88 @@ static int32_t quant_kv(int8_t *dst, const int32_t *src) {
 
 /* ------------------------------------------------------------------ binding */
 
-static const void *at(const uint8_t *base, uint32_t off) { return base + NSLM_HDR_BYTES + off; }
+/* The image may live in NSLM_NSEG separately allocated segments (nslm_seg_off, file offsets). */
+static const uint8_t *const *g_seg;
 
-static nslm_q8 q8_at(const uint8_t *b, uint32_t oq, uint32_t om, uint32_t oe) {
-    nslm_q8 w = {(const uint8_t *)at(b, oq), (const uint16_t *)at(b, om), (const int8_t *)at(b, oe)};
+static const void *at(uint32_t off) {
+    uint32_t fo = NSLM_HDR_BYTES + off;
+    int lo = 0, hi = NSLM_NSEG - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (nslm_seg_off[mid] <= fo) lo = mid;
+        else hi = mid - 1;
+    }
+    return g_seg[lo] + (fo - nslm_seg_off[lo]);
+}
+
+static nslm_q8 q8_at(uint32_t oq, uint32_t om, uint32_t oe) {
+    nslm_q8 w = {(const uint8_t *)at(oq), (const uint16_t *)at(om), (const int8_t *)at(oe)};
     return w;
 }
 
-#define Q8(b, name) q8_at(b, NSLM_OFF_##name##_q, NSLM_OFF_##name##_m, NSLM_OFF_##name##_e)
-#define LQ8(b, l, name)                                                                        \
-    q8_at(b, NSLM_OFF_l0_##name##_q + (l) * NSLM_OFF_L_STRIDE,                                 \
+#define PART(name, p) q8_at(NSLM_OFF_##name##_p##p##_q, NSLM_OFF_##name##_p##p##_m, NSLM_OFF_##name##_p##p##_e)
+#define LQ8(l, name)                                                                           \
+    q8_at(NSLM_OFF_l0_##name##_q + (l) * NSLM_OFF_L_STRIDE,                                    \
           NSLM_OFF_l0_##name##_m + (l) * NSLM_OFF_L_STRIDE,                                    \
           NSLM_OFF_l0_##name##_e + (l) * NSLM_OFF_L_STRIDE)
 
-int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state) {
-    const uint8_t *b = (const uint8_t *)image;
-    const uint32_t *h = (const uint32_t *)image;
-    if (((uintptr_t)image & 31) || len < NSLM_HDR_BYTES + NSLM_BLOB_BYTES) return -1; /* line aligned */
-    if (h[0] != NSLM_MAGIC || h[1] != NSLM_VERSION || h[2] != NSLM_BLOB_BYTES) return -2;
-    m->emb = Q8(b, emb);
 #if NSLM_SHARED_CLS
-    m->cls = m->emb;
+#define CLSPART(p) PART(emb, p)
 #else
-    m->cls = Q8(b, cls);
+#define CLSPART(p) PART(cls, p)
 #endif
+static void bind_parts(nslm_q8 *dst, int cls) {
+#define BP(p) dst[p] = cls ? CLSPART(p) : PART(emb, p);
+    NSLM_FOR_EMB_PARTS(BP) /* generated list p0..p(N-1) */
+#undef BP
+}
+
+int nslm_bind_segments(nslm_model *m, const void *const *segs, nslm_state *state) {
+    const uint32_t *h = (const uint32_t *)segs[0];
+    for (int k = 0; k < NSLM_NSEG; k++)
+        if ((uintptr_t)segs[k] & 31) return -1; /* every segment line aligned */
+    if (h[0] != NSLM_MAGIC || h[1] != NSLM_VERSION || h[2] != NSLM_BLOB_BYTES) return -2;
+    g_seg = (const uint8_t *const *)segs;
+    bind_parts(m->emb, 0);
+    bind_parts(m->cls, 1);
     for (int l = 0; l < NSLM_LAYERS; l++) {
         nslm_layer *L = &m->layer[l];
-        L->rms_att = (const int32_t *)at(b, NSLM_OFF_l0_rms_att + l * NSLM_OFF_L_STRIDE);
-        L->rms_ffn = (const int32_t *)at(b, NSLM_OFF_l0_rms_ffn + l * NSLM_OFF_L_STRIDE);
-        L->wq = LQ8(b, l, wq);
-        L->wk = LQ8(b, l, wk);
-        L->wv = LQ8(b, l, wv);
-        L->wo = LQ8(b, l, wo);
-        L->w1 = LQ8(b, l, w1);
-        L->w2 = LQ8(b, l, w2);
-        L->w3 = LQ8(b, l, w3);
+        L->rms_att = (const int32_t *)at(NSLM_OFF_l0_rms_att + l * NSLM_OFF_L_STRIDE);
+        L->rms_ffn = (const int32_t *)at(NSLM_OFF_l0_rms_ffn + l * NSLM_OFF_L_STRIDE);
+        L->wq = LQ8(l, wq);
+        L->wk = LQ8(l, wk);
+        L->wv = LQ8(l, wv);
+        L->wo = LQ8(l, wo);
+        L->w1 = LQ8(l, w1);
+        L->w2 = LQ8(l, w2);
+        L->w3 = LQ8(l, w3);
     }
-    m->rms_final = (const int32_t *)at(b, NSLM_OFF_rms_final);
-    m->rope = (const int32_t *)at(b, NSLM_OFF_rope);
+    m->rms_final = (const int32_t *)at(NSLM_OFF_rms_final);
+    m->rope = (const int32_t *)at(NSLM_OFF_rope);
     m->s = state;
     memset(state, 0, sizeof *state);
     return 0;
 }
 
+int nslm_bind(nslm_model *m, const void *image, size_t len, nslm_state *state) {
+    static const void *segs[NSLM_NSEG];
+    if (len < NSLM_HDR_BYTES + NSLM_BLOB_BYTES) return -1;
+    for (int k = 0; k < NSLM_NSEG; k++) segs[k] = (const uint8_t *)image + nslm_seg_off[k];
+    return nslm_bind_segments(m, segs, state);
+}
+
 /* ------------------------------------------------------------------ forward */
 
-static void matmul(nslm_state *s, int32_t *out, const nslm_q8 *w, int ea, int rows, int cols, int gs) {
+static void matmul(nslm_state *s, int32_t *out, const nslm_q8 *w, int ea, int rows, int cols, int gs, int bits) {
     for (int g = 0; g < cols / gs; g++) {
         int32_t t = 0;
         for (int i = g * gs; i < (g + 1) * gs; i++) t += s->a[i];
         s->asum[g] = t;
     }
-    nslm_matmul_q8(out, w, s->a, s->asum, ea, rows, cols, gs);
+    if (bits == 4)
+        nslm_matmul_q4(out, w, s->a, s->asum, ea, rows, cols, gs);
+    else
+        nslm_matmul_q8(out, w, s->a, s->asum, ea, rows, cols, gs);
 }
 
 static void attention(nslm_state *s, int l, int pos) {
@@ -261,14 +300,14 @@ void nslm_forward(nslm_model *m, int token, int pos) {
     if (token < 0 || token >= NSLM_VOCAB) token = 0; /* never index outside the compiled vocabulary */
     if (pos < 0) pos = 0;
     if (pos >= NSLM_SEQ) pos = NSLM_SEQ - 1;
-    embed(s->x, &m->emb, token);
+    embed(s->x, &m->emb[token / NSLM_EMB_PART_ROWS], token % NSLM_EMB_PART_ROWS);
     const int32_t *rope_tab = m->rope + (size_t)pos * NSLM_HEAD_DIM;
     for (int l = 0; l < NSLM_LAYERS; l++) {
         const nslm_layer *L = &m->layer[l];
         int ea = rmsnorm_act(s->a, s->x, L->rms_att, NSLM_DIM, tmp);
-        matmul(s, s->q, &L->wq, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
-        matmul(s, s->k, &L->wk, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
-        matmul(s, s->v, &L->wv, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->q, &L->wq, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_ATT, NSLM_BITS_ATT);
+        matmul(s, s->k, &L->wk, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_ATT, NSLM_BITS_ATT);
+        matmul(s, s->v, &L->wv, ea, NSLM_KV_DIM, NSLM_DIM, NSLM_GS_ATT, NSLM_BITS_ATT);
         rope(s->q, NSLM_HEADS, rope_tab);
         rope(s->k, NSLM_KV_HEADS, rope_tab);
         for (int h = 0; h < NSLM_KV_HEADS; h++) {
@@ -277,19 +316,23 @@ void nslm_forward(nslm_model *m, int token, int pos) {
         }
         attention(s, l, pos);
         ea = quant_act(s->a, s->xb, NSLM_DIM);
-        matmul(s, s->xb, &L->wo, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->xb, &L->wo, ea, NSLM_DIM, NSLM_DIM, NSLM_GS_ATT, NSLM_BITS_ATT);
         for (int i = 0; i < NSLM_DIM; i++) s->x[i] = sat32((int64_t)s->x[i] + s->xb[i]);
 
         ea = rmsnorm_act(s->a, s->x, L->rms_ffn, NSLM_DIM, tmp);
-        matmul(s, s->h1, &L->w1, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
-        matmul(s, s->h3, &L->w3, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_D);
+        matmul(s, s->h1, &L->w1, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_FFN_D, NSLM_BITS_FFN);
+        matmul(s, s->h3, &L->w3, ea, NSLM_HIDDEN, NSLM_DIM, NSLM_GS_FFN_D, NSLM_BITS_FFN);
         for (int i = 0; i < NSLM_HIDDEN; i++) s->h1[i] = silu_mul(s->h1[i], s->h3[i]);
         ea = quant_act(s->a, s->h1, NSLM_HIDDEN);
-        matmul(s, s->xb, &L->w2, ea, NSLM_DIM, NSLM_HIDDEN, NSLM_GS_H);
+        matmul(s, s->xb, &L->w2, ea, NSLM_DIM, NSLM_HIDDEN, NSLM_GS_FFN_H, NSLM_BITS_FFN);
         for (int i = 0; i < NSLM_DIM; i++) s->x[i] = sat32((int64_t)s->x[i] + s->xb[i]);
     }
     int ea = rmsnorm_act(s->a, s->x, m->rms_final, NSLM_DIM, tmp);
-    matmul(s, s->logits, &m->cls, ea, NSLM_VOCAB_ROWS, NSLM_DIM, NSLM_GS_D);
+    for (int p = 0; p < NSLM_EMB_PARTS; p++) { /* the classifier, one separately allocated part at a time */
+        int r0 = p * NSLM_EMB_PART_ROWS;
+        int rows = NSLM_VOCAB_ROWS - r0 < NSLM_EMB_PART_ROWS ? NSLM_VOCAB_ROWS - r0 : NSLM_EMB_PART_ROWS;
+        matmul(s, s->logits + r0, &m->cls[p], ea, rows, NSLM_DIM, NSLM_GS_EMB, NSLM_BITS_EMB);
+    }
 }
 
 /* ------------------------------------------------------------------ sampling */
